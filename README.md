@@ -3,8 +3,8 @@
 
 # Synology Active Backup for Business Agent — Kernel 6.15–7.0 Patches
 
-[![DKMS module build](https://github.com/Peppershade/abb-linux-agent/actions/workflows/test-dkms.yml/badge.svg)](https://github.com/Peppershade/abb-linux-agent/actions/workflows/test-dkms.yml)
-![GitHub Downloads](https://img.shields.io/github/downloads/Peppershade/abb-linux-agent/total)
+[![DKMS module build](https://github.com/the-real-droop/abb-linux-agent/actions/workflows/test-dkms.yml/badge.svg)](https://github.com/the-real-droop/abb-linux-agent/actions/workflows/test-dkms.yml)
+![GitHub Downloads](https://img.shields.io/github/downloads/the-real-droop/abb-linux-agent/total)
 
 Synology's `3.2.0-5053` release officially added support up to kernel 6.14.
 Their `synosnap` DKMS module still fails to compile on 6.15 and later due to
@@ -21,13 +21,16 @@ described below. Their compiled semantic version is already `3.2.1`.
 
 For **Ubuntu 26.04 x86-64, kernel `7.0.0-38-generic`** (Ubuntu package
 `7.0.0-38.38`), see the [installation and validation notes](docs/ubuntu-26.04.md).
-This build packages synosnap `0.12.13`. The Actions workflow produces an
-`linux-installable-assets` artifact containing `install.run`, both DEBs and
-`SHA256SUMS`. The upstream release link below may contain an older build.
+This build packages synosnap `0.12.13`. Each release includes `install.run`,
+both DEBs and `SHA256SUMS`, published automatically after the installer checks
+and all seven kernel tests pass. Ordinary CI runs also provide these files in
+the `linux-installable-assets` Actions artifact.
 
 Pre-built installer ready to deploy:
 
-**[Download install.run](https://github.com/Peppershade/abb-linux-agent/releases/latest)**
+**[Download install.run](https://github.com/the-real-droop/abb-linux-agent/releases/latest/download/install.run)**
+
+[All release assets and checksums](https://github.com/the-real-droop/abb-linux-agent/releases/latest)
 
 ```bash
 sudo bash install.run
@@ -129,6 +132,11 @@ This will:
 The generated archive supports `bash install.run --check` and
 `bash install.run --extract /path/to/empty-directory` without installing.
 Run `bash verify_build.sh install.run` to verify package metadata and sources.
+
+## Publishing a release
+
+See [the release workflow](docs/releases.md) for the manual publish option,
+version tags, attached files and recovery from an interrupted upload.
 
 ---
 

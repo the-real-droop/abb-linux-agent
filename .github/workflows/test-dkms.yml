@@ -3,12 +3,22 @@ name: Test DKMS module build
 # The optional SYNOLOGY_INSTALLER_URL secret can mirror the pinned official ZIP.
 on:
   push:
+    branches:
+      - '**'
+    tags:
+      - 'v*'
     paths:
       - 'build-tools/**'
       - 'verify_build.sh'
       - 'tests/**'
       - '.github/workflows/test-dkms.yml'
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Publish the configured agent version after all tests pass (default branch only)
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
@@ -22,7 +32,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y dpkg perl unzip
+        run: sudo apt-get update && sudo apt-get install -y dpkg perl unzip jq python3 git
 
       - name: Download and extract original Synology installer
         env:
@@ -44,6 +54,9 @@ jobs:
           bash build-tools/build.sh "$SYNOLOGY_INPUT"
           bash verify_build.sh install.run
           sha256sum --check SHA256SUMS
+
+      - name: Test release publication failure paths
+        run: bash tests/release.sh "$PWD"
 
       - name: Reject an old agent release with current version metadata
         run: |
@@ -265,3 +278,32 @@ jobs:
       - name: Show DKMS logs on failure
         if: failure()
         run: find /var/lib/dkms/synosnap -name make.log -exec cat {} +
+
+  release:
+    name: Publish GitHub release
+    needs: [build, test-kernel]
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      (github.event_name == 'workflow_dispatch' && inputs.publish_release &&
+       github.ref == format('refs/heads/{0}', github.event.repository.default_branch))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    concurrency:
+      group: github-release-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-installable-assets
+          path: release-assets
+
+      - name: Verify and publish the tested assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: bash build-tools/release.sh release-assets
