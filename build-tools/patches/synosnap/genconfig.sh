@@ -1,149 +1,117 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-only
+# Generate feature and symbol definitions for the target kernel, not the host.
+set -euo pipefail
 
-# ./genconfig.sh - generate C header for setting the correct preprocessor definitions for the kernel version
-# Usage ./genconfig.sh <kernel version> <make flags>
-# The make flags are used for determining concurrency for the feature tests, it pulls out the value of the -j flag.
-# ./genconfig.sh `uname -r` "-j4", four threads for running feature tests
-# ./genconfig.sh `uname -r` "-i -j4 -d", doesn't care about other flags present
-
-SRC_DIR=$(dirname "$0")
-OUTPUT_FILE=$SRC_DIR/kernel-config.h
+SRC_DIR=$(cd "$(dirname "$0")" && pwd)
+OUTPUT_FILE="$SRC_DIR/kernel-config.h"
 FEATURE_TEST_DIR="$SRC_DIR/configure-tests/feature-tests"
-FEATURE_TEST_FILES="$FEATURE_TEST_DIR/*.c"
-SYMBOL_TESTS_FILE="$SRC_DIR/configure-tests/symbol-tests"
-CONFIG_TESTS_FILE="$SRC_DIR/configure-tests/config-tests"
-KERNEL_VERSION=$(uname -r)
-MAX_THREADS=$(echo "$2" | sed -E 's/.*-j\s*([0-9]+).*/\1/')
-if ! [[ "$MAX_THREADS" =~ '^[0-9]+$' ]]; then # if there was no -j flag provided, default to the number of processors
-	MAX_THREADS=$(getconf _NPROCESSORS_ONLN)
+KERNEL_VERSION="${1:-$(uname -r)}"
+KDIR="${KDIR:-/lib/modules/$KERNEL_VERSION/build}"
+MAKE_FLAGS="${2:-}"
+MAX_THREADS="${SYNOSNAP_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
+if [[ "$MAKE_FLAGS" =~ -j[[:space:]]*([0-9]+) ]]; then
+    MAX_THREADS="${BASH_REMATCH[1]}"
 fi
+[[ "$MAX_THREADS" =~ ^[1-9][0-9]*$ ]] || MAX_THREADS=1
+# Each probe invokes kbuild; avoid launching hundreds of compiler processes.
+(( MAX_THREADS <= 8 )) || MAX_THREADS=8
 
-if [ ! -z "$1" ]; then
-	KERNEL_VERSION="$1"
+fail() { echo "synosnap configure: $*" >&2; exit 1; }
+# Never leave a previously generated header usable after a failed configure.
+rm -f "$OUTPUT_FILE"
+[[ -f "$KDIR/Makefile" ]] || fail "Missing headers for $KERNEL_VERSION: $KDIR"
+# Ubuntu's Makefile can report the upstream stable version (e.g. 7.0.14),
+# whereas this generated file records the actual distribution ABI release.
+if [[ -r "$KDIR/include/config/kernel.release" ]]; then
+    ACTUAL_VERSION=$(cat "$KDIR/include/config/kernel.release")
+else
+    ACTUAL_VERSION=$(make -s -C "$KDIR" kernelrelease)
 fi
+[[ "$ACTUAL_VERSION" == "$KERNEL_VERSION" ]] ||
+    fail "Header release $ACTUAL_VERSION does not match $KERNEL_VERSION"
 
-# As a fallback mechanism, if System.map is not found, download
-# the debug linux kernel package and extract it from there
-deb_extract_system_map() {
-	LINUX_IMAGE_DBG="linux-image-$KERNEL_VERSION-dbg"
-	URL=$(sudo apt-get download --print-uris linux-image-$KERNEL_VERSION-dbg | awk -F\' {'print $2'})
-	echo "Downloading $LINUX_IMAGE_DBG from $URL..."
-	if ! wget -q "$URL"; then
-		echo "Could not download $LINUX_IMAGE_DBG"
-		return 1
-	fi
-
-	echo "Unpacking..."
-	ar x linux-image-$KERNEL_VERSION-dbg*.deb || return 2
-	rm -f control.tar.xz linux-image-$KERNEL_VERSION-dbg*.deb debian-binary
-
-	echo "Processing. This may take a while..."
-	tar -xvf data.tar.xz -C / "./usr/lib/debug/boot/System.map-$KERNEL_VERSION" || return 3
-	rm -f data.tar.xz
-	echo "Done."
-
-	[ -f "$SYSTEM_MAP_FILE" ] && return 0 || return 1
-}
-
-SYSTEM_MAP_FILE="/lib/modules/${KERNEL_VERSION}/System.map"
-
-# Use standard location at the /boot
-[ ! -f "$SYSTEM_MAP_FILE" ] && SYSTEM_MAP_FILE="/boot/System.map-${KERNEL_VERSION}"
-if [ ! -f "$SYSTEM_MAP_FILE" ] || [ $(cat "$SYSTEM_MAP_FILE" | wc -l) -lt 10 ]; then
-	# File /boot/System.map-${KERNEL_VERSION} exists, but it contains just a single line on Debian 11+.
-	# Package linux-image-$(uname -r)-dbg installs normal map file.
-	SYSTEM_MAP_FILE="/usr/lib/debug/boot/System.map-${KERNEL_VERSION}"
-
-	if [ ! -f "$SYSTEM_MAP_FILE" ]; then
-		# Obtain the relevant System.map file from the
-		# dbg package if the package is being upgraded
-		if [ "$(uname -r)" != "$KERNEL_VERSION" ]; then
-			echo "No System.map found, trying to extract it from the *.deb package"
-			if [ -f /etc/debian_version ] && ! deb_extract_system_map; then
-				echo "Warning: Could not extract System.map for $KERNEL_VERSION. Falling back to /proc/kallsyms."
-				SYSTEM_MAP_FILE="/proc/kallsyms"
-				if [ "$EUID" -ne 0 ]; then
-					echo "Run 'make' command as sudo or root. Otherwise it is not possible to get addresses from the $SYSTEM_MAP_FILE"
-					exit 1
-				fi
-			fi
-		else
-			# If this is not an upgrade, fallback to kallsyms
-			SYSTEM_MAP_FILE="/proc/kallsyms"
-			if [ "$EUID" -ne 0 ]; then
-				echo "Run 'make' command as sudo or root. Otherwise it is not possible to get addresses from the $SYSTEM_MAP_FILE"
-				exit 1
-			fi
-		fi
-	fi
+# These addresses are used to relocate unexported functions relative to kfree.
+# A map from a different kernel can compile but call arbitrary kernel addresses.
+# /proc/kallsyms is valid ONLY when building for the running kernel.
+SYSTEM_MAP_FILE="${SYSTEM_MAP_FILE:-}"
+if [[ -z "$SYSTEM_MAP_FILE" ]]; then
+    for candidate in "/lib/modules/$KERNEL_VERSION/System.map" \
+        "/boot/System.map-$KERNEL_VERSION" \
+        "/usr/lib/debug/boot/System.map-$KERNEL_VERSION"; do
+        if [[ -r "$candidate" ]] &&
+            awk '$3 == "kfree" && $1 ~ /[1-9a-fA-F]/ { found=1 } END { exit !found }' "$candidate"; then
+            SYSTEM_MAP_FILE="$candidate"
+            break
+        fi
+    done
 fi
+if [[ -z "$SYSTEM_MAP_FILE" && "$(uname -r)" == "$KERNEL_VERSION" ]]; then
+    SYSTEM_MAP_FILE=/proc/kallsyms
+fi
+[[ -n "$SYSTEM_MAP_FILE" && -r "$SYSTEM_MAP_FILE" ]] ||
+    fail "No readable System.map for $KERNEL_VERSION. Install its matching kernel modules/debug package, or set SYSTEM_MAP_FILE to its matching map."
+if [[ "$SYSTEM_MAP_FILE" == /proc/kallsyms && "$(uname -r)" != "$KERNEL_VERSION" ]]; then
+    fail "Refusing running-kernel symbols for a different target kernel."
+fi
+awk '$3 == "kfree" && $1 ~ /[1-9a-fA-F]/ { found=1 } END { exit !found }' "$SYSTEM_MAP_FILE" ||
+    fail "No usable kfree address in $SYSTEM_MAP_FILE (root may be required)."
 
-echo "generating configurations for kernel-${KERNEL_VERSION}"
-
-
-rm -rf "${FEATURE_TEST_DIR}/build"
-rm -f $OUTPUT_FILE
-
-echo "//The values in this file should be generated by the build process. Do not alter." >> $OUTPUT_FILE
-echo "" >> $OUTPUT_FILE
-echo "#ifndef ELASTIO_SNAP_KERNEL_CONFIG_H" >> $OUTPUT_FILE
-echo "#define ELASTIO_SNAP_KERNEL_CONFIG_H" >> $OUTPUT_FILE
-echo "" >> $OUTPUT_FILE
-
-make -s -C $FEATURE_TEST_DIR clean KERNELVERSION=$KERNEL_VERSION
+echo "Generating configuration for $KERNEL_VERSION using $SYSTEM_MAP_FILE"
+BUILD_DIR="$FEATURE_TEST_DIR/build"
+rm -rf "$BUILD_DIR"
+mkdir -p "$BUILD_DIR/sanity"
+printf 'obj-m := sanity.o\n' > "$BUILD_DIR/sanity/Makefile"
+printf '#include <linux/module.h>\nMODULE_LICENSE("GPL");\n' > "$BUILD_DIR/sanity/sanity.c"
+if ! make -C "$KDIR" M="$BUILD_DIR/sanity" modules > "$BUILD_DIR/sanity.log" 2>&1; then
+    cat "$BUILD_DIR/sanity.log" >&2
+    fail "Kernel/compiler sanity check failed; feature tests were not run."
+fi
 
 run_one_test() {
-	local TEST="$(basename $1 .c)"
-	local MACRO_NAME="HAVE_$(echo ${TEST} | awk '{print toupper($0)}')"
-	local PREFIX="performing configure test: $MACRO_NAME -"
-	if make -C $FEATURE_TEST_DIR TEST_NAME=$TEST KERNELVERSION=$KERNEL_VERSION &>/dev/null ; then
-		echo "$PREFIX present"
-		echo "#define $MACRO_NAME" >> $OUTPUT_FILE
-	else
-		echo "$PREFIX not present"
-	fi
+    local test macro result_dir
+    test=$(basename "$1" .c)
+    macro="HAVE_${test^^}"
+    result_dir="$FEATURE_TEST_DIR/build"
+    if make -C "$FEATURE_TEST_DIR" TEST_NAME="$test" KERNELVERSION="$KERNEL_VERSION" \
+        KDIR="$KDIR" > "$result_dir/$test.log" 2>&1; then
+        printf '#define %s\n' "$macro" > "$result_dir/$test.result"
+        echo "performing configure test: $macro - present"
+    else
+        : > "$result_dir/$test.result"
+        echo "performing configure test: $macro - not present"
+    fi
 }
 export -f run_one_test
-export FEATURE_TEST_DIR
-export KERNEL_VERSION
-export OUTPUT_FILE
+export FEATURE_TEST_DIR KERNEL_VERSION KDIR
+printf '%s\0' "$FEATURE_TEST_DIR"/*.c |
+    xargs -0 -P "$MAX_THREADS" -n 1 bash -c 'run_one_test "$1"' _
 
-ls -1 -q $FEATURE_TEST_FILES | xargs -P "$MAX_THREADS" -d"\n" -n1 -I {} bash -c 'run_one_test {}'
-
-make -s -C $FEATURE_TEST_DIR clean KERNELVERSION=$KERNEL_VERSION
-
-while read SYMBOL_NAME; do
-	if [ -z "$SYMBOL_NAME" ]; then
-		continue
-	fi
-
-	echo "performing $SYMBOL_NAME lookup"
-	MACRO_NAME="$(echo ${SYMBOL_NAME} | awk '{print toupper($0)}')_ADDR"
-	SYMBOL_ADDR=$(grep " ${SYMBOL_NAME}$" "${SYSTEM_MAP_FILE}" | awk '{print $1}')
-	if [ -z "$SYMBOL_ADDR" ]; then
-		SYMBOL_ADDR="0"
-	fi
-	echo "#define $MACRO_NAME 0x$SYMBOL_ADDR" >> $OUTPUT_FILE
-done < $SYMBOL_TESTS_FILE
-
-SYSTEM_CONFIG_FILE="/boot/config-$KERNEL_VERSION"
-while read CONFIG_OPTION; do
-	if [ -z "$CONFIG_OPTION" ]; then
-		continue
-	fi
-
-	echo "checking $CONFIG_OPTION"
-	MACRO_NAME="$(echo ${CONFIG_OPTION} | awk '{print toupper($0)}')"
-	CONFIG_VALUE=$(grep "${CONFIG_OPTION}" "${SYSTEM_CONFIG_FILE}" | awk -F"=" '{print $2}')
-	if [ -n "$CONFIG_VALUE" ]; then
-		echo "#define $MACRO_NAME $CONFIG_VALUE" >> $OUTPUT_FILE
-	fi
-done < $CONFIG_TESTS_FILE
-
-if mount -V 2>&1 | grep -q "fd-based-mount"; then
-	echo "#define USE_NEW_MOUNT_API" >> $OUTPUT_FILE
-fi
-
-echo "" >> $OUTPUT_FILE
-echo "#endif" >> $OUTPUT_FILE
+TEMP_HEADER=$(mktemp "$SRC_DIR/kernel-config.h.XXXXXX")
+trap 'rm -f "$TEMP_HEADER"' EXIT
+{
+    echo "// Generated for $KERNEL_VERSION. Do not edit."
+    echo '#ifndef ELASTIO_SNAP_KERNEL_CONFIG_H'
+    echo '#define ELASTIO_SNAP_KERNEL_CONFIG_H'
+    cat "$BUILD_DIR"/*.result
+    while read -r symbol; do
+        symbol="${symbol%$'\r'}"
+        [[ -n "$symbol" ]] || continue
+        address=$(awk -v symbol="$symbol" '$3 == symbol { print $1; exit }' "$SYSTEM_MAP_FILE")
+        printf '#define %s_ADDR 0x%s\n' "${symbol^^}" "${address:-0}"
+    done < "$SRC_DIR/configure-tests/symbol-tests"
+    SYSTEM_CONFIG_FILE="${SYSTEM_CONFIG_FILE:-$KDIR/.config}"
+    [[ -r "$SYSTEM_CONFIG_FILE" ]] || SYSTEM_CONFIG_FILE="/boot/config-$KERNEL_VERSION"
+    [[ -r "$SYSTEM_CONFIG_FILE" ]] || fail "No configuration for $KERNEL_VERSION"
+    while read -r option; do
+        option="${option%$'\r'}"
+        [[ -n "$option" ]] || continue
+        value=$(awk -F= -v option="$option" '$1 == option { print $2; exit }' "$SYSTEM_CONFIG_FILE")
+        [[ -z "$value" ]] || printf '#define %s %s\n' "$option" "$value"
+    done < "$SRC_DIR/configure-tests/config-tests"
+    if mount -V 2>&1 | grep -q "fd-based-mount"; then
+        echo '#define USE_NEW_MOUNT_API'
+    fi
+    echo '#endif'
+} > "$TEMP_HEADER"
+mv "$TEMP_HEADER" "$OUTPUT_FILE"

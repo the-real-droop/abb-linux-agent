@@ -12,11 +12,17 @@ further upstream kernel API changes — leaving users on the latest distribution
 (Ubuntu 25.04/25.10) unable to back up their machines. This project patches the
 module source and repackages the installer so it works again.
 
-The version is bumped only slightly (`3.2.0-5055` over the official `3.2.0-5053`),
+The version is bumped only slightly (`3.2.0-5056` over the base official `3.2.0-5053`),
 so when Synology eventually releases an official update with proper kernel
 support, ABB will automatically install their version over this one.
 
 ## Download
+
+For **Ubuntu 26.04 x86-64, kernel `7.0.0-38-generic`** (Ubuntu package
+`7.0.0-38.38`), see the [installation and validation notes](docs/ubuntu-26.04.md).
+This build packages synosnap `0.12.13`. The Actions workflow produces an
+`linux-installable-assets` artifact containing `install.run`, both DEBs and
+`SHA256SUMS`. The upstream release link below may contain an older build.
 
 Pre-built installer ready to deploy:
 
@@ -43,25 +49,25 @@ DKMS, just like the official installer.
 | `6.19.10-061910-generic` | Ubuntu 25.10 | Verified |
 | `7.0.0-070000-generic` | Ubuntu 25.10 | Verified |
 | `7.0.0-14-generic` | Kubuntu 26.04 LTS | Verified |
+| `7.0.0-38-generic` | Ubuntu 26.04, `7.0.0-38.38`, x86-64 | DKMS build + QEMU ext4 snapshot tests |
 
 **Status legend:**
 - **Verified** — full install tested on real hardware; agent connected and backed up successfully
 - **CI Tested** — `synosnap` module compiled successfully against mainline kernel headers in GitHub Actions; not yet confirmed with a live install
+- **DKMS build + QEMU ext4 snapshot tests** — exact Ubuntu kernel booted in a
+  disposable VM; module loading, data-preserving snapshots, incremental
+  transitions, tracked unmount/remount and unloading passed. NAS backup/restore,
+  Secure Boot and other filesystems were not tested.
 
 > **Note:** Kernels 6.12–6.13 are officially supported by Synology's `3.2.0-5053` release and are not tested here.
 
 ## Secure Boot
 
-This installer is not compatible with Secure Boot. The `synosnap` DKMS module
-is not signed with a trusted key, so the kernel will refuse to load it on
-systems with Secure Boot enabled.
-
-**You must disable Secure Boot** in your firmware (UEFI) settings before
-installing, or enroll your own MOK key and sign the module manually after
-building.
-
-If you install with Secure Boot active, the module will build successfully but
-fail to load, and backups will not run.
+Secure Boot requires the locally built module to be signed by a trusted key.
+Ubuntu DKMS can sign modules with a local Machine Owner Key (MOK); that key
+must also be enrolled. This project's VM tests do not validate Secure Boot.
+Check `mokutil --sb-state` and follow Ubuntu's MOK enrollment process if the
+module is rejected with a key/signature error.
 
 Running a kernel not listed here? Please
 [open an issue](https://github.com/Peppershade/abb-linux-agent/issues)
@@ -72,7 +78,8 @@ to report whether it works — this helps others and helps us track compatibilit
 If the DKMS module build fails or you need to remove it cleanly:
 
 ```bash
-sudo dpkg --remove synosnap 2>/dev/null; sudo dkms remove synosnap/0.12.12 --all 2>/dev/null; sudo dkms remove synosnap/0.12.11 --all 2>/dev/null; true
+sudo dpkg --remove synosnap
+sudo dkms remove synosnap/0.12.13 --all
 ```
 
 ---
@@ -88,7 +95,7 @@ trusting a pre-built binary:
 - `dpkg-deb` (from `dpkg` package)
 - `tar`, `gzip`
 - `perl` (for binary version patching)
-- `makeself` (optional — the script falls back to a manual archive method)
+- `sha256sum`, `md5sum`, `awk`, `sed`, `find`, `sort`, `xargs` (standard GNU tools)
 
 On Debian/Ubuntu:
 
@@ -116,15 +123,31 @@ This will:
 1. Extract the official installer payload
 2. Unpack the `synosnap` DEB, replace source files with patched versions
 3. Repack the agent DEB with the updated version number
-4. Produce a new `install.run` in the current directory
+4. Produce `install.run`, both DEBs and `SHA256SUMS` in the current directory
+
+The generated archive supports `bash install.run --check` and
+`bash install.run --extract /path/to/empty-directory` without installing.
+Run `bash verify_build.sh install.run` to verify package metadata and sources.
 
 ---
 
 ## What is patched
 
-The `synosnap` kernel module source (`/usr/src/synosnap-0.12.12/`) is based on
+The `synosnap` kernel module source (`/usr/src/synosnap-0.12.13/`) is based on
 Synology's `0.12.10` (from `3.2.0-5053`) and patched to handle kernel API
 changes from **6.15 through 7.0**:
+
+### Ubuntu 26.04 / kernel 7.0.0-38
+
+- Use the kernel VMA allocator/free functions and `vm_flags_init` when available,
+  preserving current per-VMA lock and reference-count initialization.
+- Correct FIEMAP temporary mapping flags, cleanup order and lock release.
+- Handle error pointers from modern disk allocation.
+- Build using the target kernel's System.map; reject an unrelated running
+  kernel's symbols and fail early when the compiler/header check fails.
+- Keep DKMS, module, agent and installer versions consistent, and verify archive
+  integrity before extraction or installation.
+- Add exact Ubuntu header CI coverage and a reproducible QEMU snapshot test.
 
 ### Kernel 6.17+
 - **Data corruption fix** — `synosnap` was marking bios with bit 28 of
@@ -151,11 +174,10 @@ changes from **6.15 through 7.0**:
 - **Debian 12+ DKMS autoinstall** — the original `postinst` stripped
   `AUTOINSTALL="yes"` from `dkms.conf` on Debian 12+, causing DKMS to refuse
   to build the module. That block is now disabled during repackaging.
-- **Unloaded kernel fallback** — `genconfig.sh` hard-failed when building for
-  a kernel not currently running (e.g. after a kernel upgrade or in CI).
-  It now falls back to `/proc/kallsyms` with a warning instead of aborting.
-- **synosnap version bump to 0.12.12** — forces reinstallation of the patched
-  module on machines that already had `0.12.11` or earlier installed.
+- **Target-kernel symbols** — `genconfig.sh` accepts `/proc/kallsyms` only for the
+  running target kernel. Offline builds use that kernel's matching System.map.
+- **synosnap version bump to 0.12.13** — forces reinstallation of the patched
+  module on machines that already had `0.12.12` or earlier installed.
 
 ## Repository layout
 
@@ -163,7 +185,7 @@ changes from **6.15 through 7.0**:
 build-tools/
   build.sh                       # Main build script
   patches/
-    variables.sh                 # Installer variable overrides (version 5055)
+    variables.sh                 # Installer variable overrides (version 5056)
     synosnap/                    # Patched kernel module sources
       configure-tests/
         feature-tests/           # Kernel feature detection tests
