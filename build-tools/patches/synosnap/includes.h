@@ -11,6 +11,7 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/blkdev.h>
+#include <linux/fs.h>
 // 'genhd.h' has been removed and 'gendisk' struct has been moved to the 'blkdev.h' in the kernel 5.18.
 // Old compilers may not have '__has_include' macro, but 'genhd.h' exists on those systems.
 #if defined __has_include
@@ -32,6 +33,7 @@
 #include <linux/random.h>
 #include <asm/div64.h>
 #include <linux/mm.h>
+#include <linux/mman.h>
 #include <linux/blk-mq.h>
 
 #endif

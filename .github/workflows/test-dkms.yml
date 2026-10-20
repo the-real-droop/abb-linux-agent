@@ -1,19 +1,19 @@
 name: Test DKMS module build
 
-# Runs on every push to master and can be triggered manually.
-# Requires the SYNOLOGY_INSTALLER_URL repository secret to be set —
-# point it at a direct download URL for the official Synology
-# Active Backup for Business Agent 3.2.0-5053 Linux installer (.run).
-
+# The optional SYNOLOGY_INSTALLER_URL secret can mirror the pinned official ZIP.
 on:
   push:
-    branches: [master, test-ci, 3.2.0-5054]
     paths:
       - 'build-tools/**'
+      - 'verify_build.sh'
+      - 'tests/**'
+      - '.github/workflows/test-dkms.yml'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
-  # ── Step 1: build the patched install.run and extract the synosnap DEB ──────
   build:
     runs-on: ubuntu-24.04
     outputs:
@@ -22,129 +22,226 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install build dependencies
-        run: sudo apt-get install -y dpkg perl dos2unix
-
-      - name: Fix line endings (repo checked out on Windows)
-        run: find build-tools -name "*.sh" | xargs dos2unix
+        run: sudo apt-get update && sudo apt-get install -y dpkg perl unzip
 
       - name: Download and extract original Synology installer
+        env:
+          INSTALLER_URL: ${{ secrets.SYNOLOGY_INSTALLER_URL }}
         run: |
-          curl -fsSL "${{ secrets.SYNOLOGY_INSTALLER_URL }}" -o synology.zip
+          INSTALLER_URL="${INSTALLER_URL:-https://global.synologydownload.com/download/Utility/ActiveBackupBusinessAgent/3.2.0-5053/Linux/x86_64/Synology%20Active%20Backup%20for%20Business%20Agent-3.2.0-5053-x64-deb.zip}"
+          curl --fail --location --retry 3 "$INSTALLER_URL" -o synology.zip
+          echo 'b6625ae7b8a5bfdcb03647f8335b7de70d6bb51d11da2c27ea3fec036a68a22f  synology.zip' | sha256sum --check
           unzip -q synology.zip -d synology_pkg
-          # Find the .run file or extracted directory inside the zip
-          RUN=$(find synology_pkg -maxdepth 2 -name "*.run" | head -1)
-          if [ -n "$RUN" ]; then
-            echo "SYNOLOGY_INPUT=$RUN" >> "$GITHUB_ENV"
-          else
-            DIR=$(find synology_pkg -maxdepth 2 -name "install.sh" | head -1 | xargs -I{} dirname {})
-            echo "SYNOLOGY_INPUT=$DIR" >> "$GITHUB_ENV"
+          mapfile -d '' RUNS < <(find synology_pkg -maxdepth 3 -name '*.run' -print0)
+          if [ "${#RUNS[@]}" -ne 1 ]; then
+            echo 'Expected exactly one original .run installer in the download'
+            exit 1
           fi
-          echo "Using input: $SYNOLOGY_INPUT"
+          echo "SYNOLOGY_INPUT=${RUNS[0]}" >> "$GITHUB_ENV"
 
-      - name: Build patched installer
-        run: bash build-tools/build.sh "$SYNOLOGY_INPUT"
+      - name: Build and verify patched installer
+        run: |
+          bash build-tools/build.sh "$SYNOLOGY_INPUT"
+          bash verify_build.sh install.run
+          sha256sum --check SHA256SUMS
+
+      - name: Read patched module package metadata
+        id: meta
+        run: |
+          shopt -s nullglob
+          PACKAGES=(synosnap-*.deb)
+          test "${#PACKAGES[@]}" -eq 1
+          VER=$(dpkg-deb -f "${PACKAGES[0]}" Version)
+          echo "synosnap-version=$VER" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: install.run
-          path: install.run
-
-      - name: Extract synosnap DEB from install.run
-        id: meta
-        run: |
-          mkdir payload
-          SKIP=$(awk '/^__ARCHIVE_BELOW__/{print NR+1; exit}' install.run)
-          tail -n+"$SKIP" install.run | tar xzf - -C payload
-          cp payload/synosnap-*.deb .
-          VER=$(ls synosnap-*.deb | grep -oP '\d+\.\d+\.\d+' | head -1)
-          echo "synosnap-version=$VER" >> "$GITHUB_OUTPUT"
-          echo "Built synosnap version: $VER"
+          name: linux-installable-assets
+          if-no-files-found: error
+          path: |
+            install.run
+            *.deb
+            SHA256SUMS
 
       - uses: actions/upload-artifact@v4
         with:
           name: synosnap-deb
+          if-no-files-found: error
           path: synosnap-*.deb
 
-  # ── Step 2: compile the DKMS module against each target kernel ───────────────
   test-kernel:
     needs: build
     runs-on: ubuntu-24.04
-    container: ${{ matrix.container }}   # non-empty only for kernels needing newer GCC
+    # Mainline 6.18+ and Ubuntu 26.04 kernel 7.0 use GCC 15. An explicit
+    # compiler also prevents feature probes from silently using runner GCC 13.
+    container: ubuntu:26.04
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: gcc-15
+      MAKEFLAGS: '-- CC=gcc-15'
     strategy:
       fail-fast: false
       matrix:
         include:
           - kernel: '6.14'
+            source: mainline
           - kernel: '6.15'
+            source: mainline
           - kernel: '6.17'
+            source: mainline
           - kernel: '6.18'
-            container: 'ubuntu:25.10'   # provides GCC 15; no hosted runner exists for 25.x
+            source: mainline
           - kernel: '6.19'
-            container: 'ubuntu:25.10'   # provides GCC 15; no hosted runner exists for 25.x
+            source: mainline
+          - kernel: '7.0'
+            source: mainline
+          - kernel: '7.0.0-38-generic'
+            source: ubuntu
+            package-version: '7.0.0-38.38'
 
     steps:
-      - name: Bootstrap container environment
-        if: ${{ matrix.container != '' }}
-        run: apt-get update -qq && apt-get install -y sudo curl wget ca-certificates dpkg
-
-      - name: Install DKMS
-        run: sudo apt-get update && sudo apt-get install -y dkms
-
-      - name: Install mainline kernel headers (${{ matrix.kernel }})
+      - name: Install DKMS and matching compiler
         run: |
-          BASE="https://kernel.ubuntu.com/mainline/v${{ matrix.kernel }}/amd64"
-          PAGE=$(curl -s "$BASE/")
-          ALL=$(echo "$PAGE" | grep -oP 'linux-headers-[^"<>]+_all\.deb' | head -1)
-          GEN=$(echo "$PAGE" | grep -oP 'linux-headers-[^"<>]+-generic[^"<>]+_amd64\.deb' | head -1)
-          if [ -z "$ALL" ] || [ -z "$GEN" ]; then
-            echo "Could not find header packages at $BASE"
-            echo "$PAGE"
-            exit 1
-          fi
-          echo "All headers:     $ALL"
-          echo "Generic headers: $GEN"
-          wget -q "$BASE/$ALL" "$BASE/$GEN"
-          sudo dpkg -i linux-headers-*.deb
+          apt-get update -qq
+          DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            dkms gcc-15 g++-15 make binutils dpkg curl ca-certificates \
+            libelf-dev kmod xz-utils zstd python3
+          gcc-15 --version
 
-      - name: Detect installed kernel version
-        id: kver
+      - uses: actions/checkout@v4
+
+      - name: Install mainline kernel headers and matching symbol map
+        if: matrix.source == 'mainline'
+        env:
+          TARGET_KERNEL: ${{ matrix.kernel }}
         run: |
-          KVER=$(dpkg -l 'linux-headers-*-generic' | awk '/^ii/{print $2}' | sed 's/linux-headers-//' | tail -1)
-          echo "kver=$KVER" >> "$GITHUB_OUTPUT"
-          echo "Target kernel: $KVER"
+          BASE="https://kernel.ubuntu.com/mainline/v${TARGET_KERNEL}/amd64"
+          curl --fail --location --retry 3 "$BASE/" -o mainline-index.html
+          # Parse unique href values: the listing repeats filenames in link text.
+          python3 - <<'PY' > mainline-packages.txt
+          from html.parser import HTMLParser
+          import re
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = set()
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'a':
+                      self.links.update(v for k, v in attrs if k == 'href' and v)
+          parser = Links()
+          with open('mainline-index.html') as index:
+              parser.feed(index.read())
+          patterns = (
+              r'linux-headers-[^/]+_all\.deb',
+              r'linux-headers-[^/]+-generic_[^/]+_amd64\.deb',
+              r'linux-modules-[^/]+-generic_[^/]+_amd64\.deb',
+          )
+          for pattern in patterns:
+              matches = sorted(link for link in parser.links if re.fullmatch(pattern, link))
+              if len(matches) != 1:
+                  raise SystemExit(f'Expected one package for {pattern}, found {matches}')
+              print(matches[0])
+          PY
+          while IFS= read -r package; do
+            curl --fail --location --retry 3 "$BASE/$package" -o "$package"
+          done < mainline-packages.txt
+          apt-get install -y ./linux-headers-*.deb
+          GEN=$(find . -maxdepth 1 -name 'linux-headers-*-generic_*_amd64.deb')
+          KVER=$(dpkg-deb -f "$GEN" Package)
+          KVER="${KVER#linux-headers-}"
+          mkdir -p /boot kernel-map
+          dpkg-deb --fsys-tarfile ./linux-modules-*-generic_*_amd64.deb |
+            tar -x -C kernel-map --wildcards './boot/System.map-*'
+          install -m 0644 "kernel-map/boot/System.map-$KVER" "/boot/System.map-$KVER"
+          echo "KVER=$KVER" >> "$GITHUB_ENV"
+
+      - name: Install exact Ubuntu 26.04 headers and matching symbol map
+        if: matrix.source == 'ubuntu'
+        env:
+          TARGET_KERNEL: ${{ matrix.kernel }}
+          PACKAGE_VERSION: ${{ matrix.package-version }}
+        run: |
+          apt-get install -y "linux-headers-${TARGET_KERNEL}=${PACKAGE_VERSION}"
+          apt-get download "linux-modules-${TARGET_KERNEL}=${PACKAGE_VERSION}"
+          mkdir -p /boot kernel-map
+          dpkg-deb --fsys-tarfile ./linux-modules-*.deb |
+            tar -x -C kernel-map --wildcards './boot/System.map-*'
+          install -m 0644 "kernel-map/boot/System.map-$TARGET_KERNEL" "/boot/System.map-$TARGET_KERNEL"
+          echo "KVER=$TARGET_KERNEL" >> "$GITHUB_ENV"
 
       - uses: actions/download-artifact@v4
         with:
           name: synosnap-deb
 
       - name: Register synosnap source with DKMS
+        env:
+          SNAP_VERSION: ${{ needs.build.outputs.synosnap-version }}
         run: |
-          VER="${{ needs.build.outputs.synosnap-version }}"
-          dpkg-deb -x synosnap-*.deb /tmp/synosnap-extract
-          sudo cp -r "/tmp/synosnap-extract/usr/src/synosnap-${VER}" /usr/src/
-          sudo dkms add "synosnap/${VER}"
+          dpkg-deb -x "synosnap-${SNAP_VERSION}.deb" /tmp/synosnap-extract
+          cp -r "/tmp/synosnap-extract/usr/src/synosnap-${SNAP_VERSION}" /usr/src/
+          dkms add "synosnap/${SNAP_VERSION}"
 
-      - name: Verify kernel build system (diagnostic)
+      - name: Test feature-detector failure paths
+        env:
+          SNAP_VERSION: ${{ needs.build.outputs.synosnap-version }}
+        run: bash tests/genconfig.sh "/usr/src/synosnap-${SNAP_VERSION}" "$KVER" "/boot/System.map-$KVER"
+
+      - name: Verify target kernel build system
         run: |
-          KVER="${{ steps.kver.outputs.kver }}"
-          TMPDIR=$(mktemp -d)
-          printf 'obj-m := dummy.o\nccflags-y := -Werror\n' > "$TMPDIR/Kbuild"
-          printf '#include <linux/module.h>\nMODULE_LICENSE("GPL");\n' > "$TMPDIR/dummy.c"
-          make -C "/lib/modules/$KVER/build" M="$TMPDIR" modules 2>&1 \
-            && echo "Build system OK" \
-            || echo "::warning::Kernel build system check failed for $KVER — feature tests will all report 'not present'"
-          rm -rf "$TMPDIR"
+          test -s "/boot/System.map-$KVER"
+          test -d "/lib/modules/$KVER/build"
+          grep '^CONFIG_CC_VERSION_TEXT=' "/lib/modules/$KVER/build/.config"
+          PROBE_DIR=$(mktemp -d)
+          trap 'rm -rf "$PROBE_DIR"' EXIT
+          printf 'obj-m := dummy.o\nccflags-y := -Werror\n' > "$PROBE_DIR/Kbuild"
+          printf '#include <linux/module.h>\nMODULE_LICENSE("GPL");\n' > "$PROBE_DIR/dummy.c"
+          make -C "/lib/modules/$KVER/build" M="$PROBE_DIR" CC="$CC" modules
 
       - name: Build DKMS module
+        env:
+          SNAP_VERSION: ${{ needs.build.outputs.synosnap-version }}
         run: |
-          sudo dkms build "synosnap/${{ needs.build.outputs.synosnap-version }}" \
-            -k "${{ steps.kver.outputs.kver }}"
+          dkms build "synosnap/${SNAP_VERSION}" -k "$KVER"
+          mapfile -d '' MODULES < <(find "/var/lib/dkms/synosnap/${SNAP_VERSION}/$KVER/x86_64/module" \
+            -maxdepth 1 -name 'synosnap.ko*' -print0)
+          test "${#MODULES[@]}" -eq 1
+          MODULE="${MODULES[0]}"
+          test "$(modinfo -F vermagic "$MODULE" | cut -d ' ' -f 1)" = "$KVER"
+          test "$(modinfo -F version "$MODULE")" = "$SNAP_VERSION"
+          echo "MODULE=$MODULE" >> "$GITHUB_ENV"
+          dkms status synosnap
 
-      - name: Show make.log on failure
+      - name: Test snapshots in a disposable Ubuntu 26.04 VM
+        if: matrix.source == 'ubuntu'
+        env:
+          PACKAGE_VERSION: ${{ matrix.package-version }}
+        run: |
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            qemu-system-x86 busybox-static cpio e2fsprogs
+          apt-get download "linux-image-unsigned-${KVER}=${PACKAGE_VERSION}"
+          mkdir -p kernel-image
+          dpkg-deb --fsys-tarfile ./linux-image-unsigned-*.deb |
+            tar -x -C kernel-image --wildcards './boot/vmlinuz-*'
+          case "$MODULE" in
+            *.ko.zst) zstd -dc "$MODULE" > /tmp/synosnap.ko ;;
+            *.ko.xz) xz -dc "$MODULE" > /tmp/synosnap.ko ;;
+            *.ko.gz) gzip -dc "$MODULE" > /tmp/synosnap.ko ;;
+            *.ko) cp "$MODULE" /tmp/synosnap.ko ;;
+            *) echo "Unsupported module compression: $MODULE"; exit 1 ;;
+          esac
+          bash build-tools/tests/qemu-smoke.sh \
+            "kernel-image/boot/vmlinuz-$KVER" /tmp/synosnap.ko qemu-snapshot-smoke.log
+
+      - name: Upload Ubuntu 26.04 guest test log
+        if: always() && matrix.source == 'ubuntu'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ubuntu-26.04-kernel-7.0.0-38-snapshot-test
+          path: qemu-snapshot-smoke.log
+          if-no-files-found: warn
+
+      - name: Show DKMS logs on failure
         if: failure()
-        run: |
-          LOG="/var/lib/dkms/synosnap/${{ needs.build.outputs.synosnap-version }}/build/make.log"
-          [ -f "$LOG" ] && cat "$LOG" || echo "make.log not found"
-
-      - name: Show DKMS status
-        run: dkms status synosnap
+        run: find /var/lib/dkms/synosnap -name make.log -exec cat {} +

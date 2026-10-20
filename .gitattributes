@@ -6,3 +6,5 @@
 *.conf      text eol=lf
 Makefile    text eol=lf
 Kbuild      text eol=lf
+*-tests     text eol=lf
+dkms_pre_install text eol=lf

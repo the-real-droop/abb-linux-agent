@@ -2731,6 +2731,17 @@ static inline void elastio_snap_mm_unlock(struct mm_struct *mm)
 #endif
 }
 
+#ifdef HAVE_VM_AREA_ALLOC
+static struct vm_area_struct *(*elastio_vm_area_alloc)(struct mm_struct *) =
+	(VM_AREA_ALLOC_ADDR != 0) ?
+	(struct vm_area_struct *(*)(struct mm_struct *))
+	(VM_AREA_ALLOC_ADDR + (long long)(((void *)kfree) - (void *)KFREE_ADDR)) : NULL;
+
+static void (*elastio_vm_area_free)(struct vm_area_struct *) =
+	(VM_AREA_FREE_ADDR != 0) ?
+	(void (*)(struct vm_area_struct *))
+	(VM_AREA_FREE_ADDR + (long long)(((void *)kfree) - (void *)KFREE_ADDR)) : NULL;
+#else
 struct kmem_cache **vm_area_cache = (VM_AREA_CACHEP_ADDR != 0) ?
 	(struct kmem_cache **) (VM_AREA_CACHEP_ADDR + (long long)(((void *)kfree) - (void *)KFREE_ADDR)) : NULL;
 
@@ -2738,12 +2749,29 @@ struct kmem_cache **vm_area_cache = (VM_AREA_CACHEP_ADDR != 0) ?
 static struct kmem_cache **vma_lock_cache = (VMA_LOCK_CACHEP_ADDR != 0) ?
 	(struct kmem_cache **) (VMA_LOCK_CACHEP_ADDR + (long long)(((void *)kfree) - (void *)KFREE_ADDR)) : NULL;
 #endif
+#endif
 
 static struct vm_area_struct *elastio_snap_vm_area_allocate(struct mm_struct *mm)
 {
 	struct vm_area_struct *vma;
 	static const struct vm_operations_struct dummy_vm_ops = {};
 
+#ifdef HAVE_VM_AREA_ALLOC
+	/*
+	 * The kernel allocator owns VMA lock/refcount initialization. In
+	 * particular, recent kernels use SLAB_TYPESAFE_BY_RCU and cannot safely
+	 * use a zeroed slab object in place of vm_area_alloc().
+	 * https://github.com/torvalds/linux/blob/v7.0/mm/vma_init.c
+	 */
+	if (!elastio_vm_area_alloc || !elastio_vm_area_free) {
+		LOG_ERROR(-ENOTSUPP, "vm_area_alloc()/vm_area_free() were not found");
+		return NULL;
+	}
+	vma = elastio_vm_area_alloc(mm);
+	if (vma)
+		vma->vm_ops = &dummy_vm_ops;
+	return vma;
+#else
 	if (!vm_area_cache) {
 		LOG_ERROR(-ENOTSUPP, "vm_area_cachep was not found");
 		return NULL;
@@ -2769,11 +2797,16 @@ static struct vm_area_struct *elastio_snap_vm_area_allocate(struct mm_struct *mm
 	vma->vm_ops = &dummy_vm_ops;
 	INIT_LIST_HEAD(&vma->anon_vma_chain);
 	return vma;
+#endif
 }
 
 static void elastio_snap_vm_area_free(struct vm_area_struct *vma)
 {
+#ifdef HAVE_VM_AREA_ALLOC
+	elastio_vm_area_free(vma);
+#else
 	kmem_cache_free(*vm_area_cache, vma);
+#endif
 }
 
 static unsigned long elastio_snap_get_unmapped_area(struct file *file, unsigned long addr, unsigned long len, unsigned long pgoff, unsigned long flags) {
@@ -2822,9 +2855,11 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 
 	elastio_snap_mm_lock(task->mm);
 
-	start_addr = elastio_snap_get_unmapped_area(NULL, 0, cow_ext_buf_size, 0, VM_READ | VM_WRITE);
-	if (IS_ERR_VALUE(start_addr))
+	start_addr = elastio_snap_get_unmapped_area(NULL, 0, cow_ext_buf_size, 0, MAP_PRIVATE | MAP_ANONYMOUS);
+	if (IS_ERR_VALUE(start_addr)) {
+		elastio_snap_mm_unlock(task->mm);
 		return start_addr; // returns -EPERM if failed
+	}
 
 	// we must give fiemap() a userspace buffer, so we
 	// brutally impose pages to the parent process
@@ -2838,7 +2873,11 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 
 	vma->vm_start = start_addr;
 	vma->vm_end = start_addr + cow_ext_buf_size;
+#ifdef HAVE_VM_FLAGS_INIT
+	vm_flags_init(vma, vm_flags);
+#else
 	*(unsigned long *) &vma->vm_flags = vm_flags;
+#endif
 	vma->vm_page_prot = vm_get_page_prot(vm_flags);
 	vma->vm_pgoff = 0;
 
@@ -2855,8 +2894,8 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 	if (!pg) {
 		ret = -ENOMEM;
 		LOG_ERROR(ret, "alloc_page() failed");
-		elastio_snap_vm_area_free(vma);
 		elastio_snap_mm_unlock(task->mm);
+		vm_munmap(start_addr, cow_ext_buf_size);
 		return ret;
 	}
 
@@ -2864,10 +2903,10 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 	ret = remap_pfn_range(vma, vma->vm_start, page_to_pfn(pg), cow_ext_buf_size, PAGE_SHARED);
 	if (ret < 0) {
 		LOG_ERROR(ret, "remap_pfn_range() failed");
+		elastio_snap_mm_unlock(task->mm);
+		vm_munmap(start_addr, cow_ext_buf_size);
 		ClearPageReserved(pg);
 		__free_pages(pg, get_order(cow_ext_buf_size));
-		elastio_snap_vm_area_free(vma);
-		elastio_snap_mm_unlock(task->mm);
 		return ret;
 	}
 
@@ -2914,9 +2953,9 @@ static int elastio_snap_get_cow_file_extents(struct snap_device *dev, struct fil
 	}
 
 out:
-	ClearPageReserved(pg);
 	elastio_snap_mm_unlock(task->mm);
-	vm_munmap(vma->vm_start, cow_ext_buf_size);
+	vm_munmap(start_addr, cow_ext_buf_size);
+	ClearPageReserved(pg);
 	__free_pages(pg, get_order(cow_ext_buf_size));
 	return ret;
 }
@@ -5313,8 +5352,12 @@ static int __tracer_setup_snap(struct snap_device *dev, unsigned int minor, stru
 #else
 	LOG_DEBUG("allocating gendisk & queue");
 	dev->sd_gd = elastio_snap_blk_alloc_disk();
-	if(!dev->sd_gd){
-		ret = -ENOMEM;
+	/* Modern __blk_alloc_disk() returns ERR_PTR; older kernels return NULL.
+	 * https://github.com/torvalds/linux/blob/v7.0/block/genhd.c
+	 */
+	if(IS_ERR_OR_NULL(dev->sd_gd)){
+		ret = dev->sd_gd ? PTR_ERR(dev->sd_gd) : -ENOMEM;
+		dev->sd_gd = NULL;
 		LOG_ERROR(ret, "error allocating gendisk");
 		goto error;
 	}

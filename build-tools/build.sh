@@ -1,257 +1,247 @@
 #!/bin/bash
-# build.sh - Rebuild Synology Active Backup for Business Agent with kernel 6.15-7.0 patches
-#
-# Usage:
-#   ./build.sh /path/to/original-install.run              # from original .run file
-#   ./build.sh /path/to/extracted-directory                # from already-extracted dir
-#
-# Output: install.run in current directory (or $OUTPUT_DIR if set)
-#
-# Requirements: dpkg-deb, tar, gzip, makeself (optional, falls back to manual)
-# Must run on Linux (or WSL).
-
+# Repackage the official 3.2.0-5053 amd64 installer with the repository patches.
+# Usage: bash build-tools/build.sh <original-install.run | extracted-directory>
+# OUTPUT_DIR selects the directory for install.run, both DEBs and SHA256SUMS.
+# TEMP_DIR selects a Linux scratch directory; no installation is performed.
 set -euo pipefail
+export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATCHES_DIR="$SCRIPT_DIR/patches"
-AGENT_VERSION="3.2.0-5055"
-AGENT_BUILD_TAG="5055"
-SYNOSNAP_VERSION="0.12.12"
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)}"
 TEMP_DIR="${TEMP_DIR:-/tmp}"
+SOURCE_AGENT_VERSION="3.2.0-5053"
+SOURCE_SYNOSNAP_VERSION="0.12.10"
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+info() { printf '[INFO] %s\n' "$*"; }
+fail() { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
-info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
-ok()    { echo -e "${GREEN}[ OK ]${NC} $*"; }
-fail()  { echo -e "${RED}[FAIL]${NC} $*"; exit 1; }
+[[ $# == 1 ]] || fail "Usage: $0 <original-install.run | extracted-directory>"
+for tool in dpkg-deb tar gzip perl sha256sum md5sum awk sed find sort xargs; do
+    command -v "$tool" >/dev/null || fail "Required build tool not found: $tool"
+done
 
-# --- Validate input ---
-if [ $# -lt 1 ]; then
-    echo "Usage: $0 <original-install.run | extracted-directory>"
-    echo ""
-    echo "Examples:"
-    echo "  $0 ./install.run"
-    echo "  $0 ./Synology\\ Active\\ Backup\\ for\\ Business\\ Agent-3.2.0-5053-x64-deb/extracted"
-    exit 1
-fi
+# Keep package filenames and all version tags in one place. Normalize CRLF from
+# Windows checkouts before reading these repository-owned variables.
+source <(sed 's/\r$//' "$PATCHES_DIR/variables.sh")
+AGENT_BUILD_TAG="$AGENT_VERSION"
+FULL_AGENT_VERSION="${AGENT_PACKAGE#Synology Active Backup for Business Agent-}"
+FULL_AGENT_VERSION="${FULL_AGENT_VERSION%.deb}"
+SYNOSNAP_VERSION="$DATTOBD_VERSION"
+[[ "$FULL_AGENT_VERSION" == "3.2.0-$AGENT_BUILD_TAG" ]] ||
+    fail "Agent package filename and build tag disagree in variables.sh"
+[[ "$DATTOBD_PACKAGE" == "synosnap-$SYNOSNAP_VERSION.deb" ]] ||
+    fail "synosnap package filename and version disagree in variables.sh"
+[[ "$AGENT_BUILD_TAG" =~ ^[0-9]{4}$ ]] ||
+    fail "The binary build tag must remain four digits"
 
 INPUT="$1"
-WORKDIR=$(mktemp -d "$TEMP_DIR/abb-rebuild.XXXXXX")
-trap 'rm -rf "$WORKDIR"' EXIT
-
+mkdir -p "$OUTPUT_DIR" "$TEMP_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
+WORKDIR="$(mktemp -d "$TEMP_DIR/abb-rebuild.XXXXXX")"
+trap 'rm -rf -- "$WORKDIR"' EXIT
 info "Work directory: $WORKDIR"
 
-# --- Step 1: Get extracted directory ---
-if [ -d "$INPUT" ]; then
-    # Input is a directory — check if it looks like the extracted payload
-    if [ -f "$INPUT/install.sh" ] && [ -f "$INPUT/variables.sh" ]; then
+# Extract the payload without executing any code from the input installer.
+if [[ -d "$INPUT" ]]; then
+    if [[ -f "$INPUT/install.sh" ]]; then
         EXTRACTED="$INPUT"
-        info "Using provided extracted directory: $EXTRACTED"
-    elif [ -d "$INPUT/extracted" ]; then
-        EXTRACTED="$INPUT/extracted"
-        info "Using extracted subdirectory: $EXTRACTED"
     else
-        fail "Directory doesn't look like an extracted installer. Expected install.sh + variables.sh"
+        EXTRACTED="$INPUT/extracted"
     fi
-elif [ -f "$INPUT" ]; then
-    info "Extracting original install.run..."
+elif [[ -f "$INPUT" ]]; then
     EXTRACTED="$WORKDIR/extracted"
     mkdir -p "$EXTRACTED"
-
-    # The Synology .run is a shell script header + gzipped tar payload.
-    # Find the line with __ARCHIVE_BELOW__ or the end of the shell header.
-    # The original uses makeself-style format: skip N lines of shell header.
-    SKIP_LINES=$(awk '/^__ARCHIVE_BELOW__/{print NR+1; exit}' "$INPUT" 2>/dev/null || true)
-
-    if [ -n "$SKIP_LINES" ]; then
-        tail -n+"$SKIP_LINES" "$INPUT" | tar xzf - -C "$EXTRACTED"
-    else
-        # Makeself format: offset is at a fixed line count in the header
-        # Try to find the offset by looking for the payload marker
-        SCRIPT_END_LINE=$(grep -a -n 'eval $finish; exit $res' "$INPUT" | sed -r 's/^([0-9]+?)\:.+$/\1/')
-        OFFSET=$(head -n $SCRIPT_END_LINE "$INPUT" | wc -c | tr -d ' ')
-        dd if="$INPUT" bs="$OFFSET" skip=1 2>/dev/null | gzip -cd | tar xf - -C "$EXTRACTED"
+    ARCHIVE_LINE="$(awk '/^__ARCHIVE_BELOW__$/ {print NR + 1; exit}' "$INPUT")"
+    if [[ -z "$ARCHIVE_LINE" ]]; then
+        # Synology's Makeself header declares the number of lines to skip.
+        SKIP_LINES="$(sed -n 's/^skip="\([0-9][0-9]*\)"$/\1/p' "$INPUT" | head -n 1)"
+        [[ "$SKIP_LINES" =~ ^[0-9]+$ ]] ||
+            fail "Unsupported installer format: no archive marker or Makeself skip count"
+        ARCHIVE_LINE="$((10#$SKIP_LINES + 1))"
     fi
-
-    if [ ! -f "$EXTRACTED/install.sh" ]; then
-        fail "Extraction failed — install.sh not found in payload"
-    fi
-    ok "Extracted installer payload"
+    tail -n +"$ARCHIVE_LINE" "$INPUT" | tar xzf - -C "$EXTRACTED"
 else
     fail "Input '$INPUT' is neither a file nor a directory"
 fi
-
-# --- Locate the original DEBs ---
-ORIG_AGENT_DEB=$(find "$EXTRACTED" -maxdepth 1 -name "Synology Active Backup for Business Agent-*.deb" | head -1)
-ORIG_SYNOSNAP_DEB=$(find "$EXTRACTED" -maxdepth 1 -name "synosnap-*.deb" | head -1)
-
-[ -z "$ORIG_AGENT_DEB" ] && fail "Original agent DEB not found in $EXTRACTED"
-[ -z "$ORIG_SYNOSNAP_DEB" ] && fail "Original synosnap DEB not found in $EXTRACTED"
-
-# Verify it's the expected source version
-ORIG_AGENT_VER=$(basename "$ORIG_AGENT_DEB" | grep -oP '\d+\.\d+\.\d+-\d+')
-info "Source agent version: ${ORIG_AGENT_VER}"
-
-info "Original agent DEB: $(basename "$ORIG_AGENT_DEB")"
-info "Original synosnap DEB: $(basename "$ORIG_SYNOSNAP_DEB")"
-
-# --- Step 2: Repackage synosnap DEB with patched sources ---
-info "Repacking synosnap DEB with kernel 6.15-7.0 patches..."
-
-SNAP_WORK="$WORKDIR/synosnap_repack"
-mkdir -p "$SNAP_WORK"
-
-dpkg-deb -R "$ORIG_SYNOSNAP_DEB" "$SNAP_WORK/repack"
-chmod 0755 "$SNAP_WORK/repack/DEBIAN"
-
-# Rename the source tree to the new version and update control/dkms.conf
-ORIG_SNAP_SRC=$(find "$SNAP_WORK/repack/usr/src" -maxdepth 1 -name "synosnap-*" -type d | head -1)
-[ -z "$ORIG_SNAP_SRC" ] && fail "synosnap source directory not found in unpacked DEB"
-SNAP_SRC="$SNAP_WORK/repack/usr/src/synosnap-${SYNOSNAP_VERSION}"
-if [ "$ORIG_SNAP_SRC" != "$SNAP_SRC" ]; then
-    mv "$ORIG_SNAP_SRC" "$SNAP_SRC"
-fi
-sed -i "s/^Version: .*/Version: ${SYNOSNAP_VERSION}/" "$SNAP_WORK/repack/DEBIAN/control"
-if [ -f "$SNAP_SRC/dkms.conf" ]; then
-    sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"${SYNOSNAP_VERSION}\"/" "$SNAP_SRC/dkms.conf"
-fi
-
-# Copy all patched synosnap source files
-info "  Copying patched configure-tests..."
-for f in "$PATCHES_DIR/synosnap/configure-tests/feature-tests/"*; do
-    dest="$SNAP_SRC/configure-tests/feature-tests/$(basename "$f")"
-    sed 's/\r//' "$f" > "$dest"
-    chmod --reference="$f" "$dest" 2>/dev/null || true
-done
-sed 's/\r//' "$PATCHES_DIR/synosnap/configure-tests/config-tests" \
-    > "$SNAP_SRC/configure-tests/config-tests"
-sed 's/\r//' "$PATCHES_DIR/synosnap/configure-tests/symbol-tests" \
-    > "$SNAP_SRC/configure-tests/symbol-tests"
-
-info "  Copying patched source files..."
-for f in genconfig.sh includes.h main.c extract_mount_params.c extract_mount_params.h \
-         elastio-snap.h nl_debug.c nl_debug.h Makefile; do
-    sed 's/\r//' "$PATCHES_DIR/synosnap/$f" > "$SNAP_SRC/$f"
-    chmod --reference="$PATCHES_DIR/synosnap/$f" "$SNAP_SRC/$f" 2>/dev/null || true
-    [[ "$f" == *.sh ]] && chmod +x "$SNAP_SRC/$f"
+for file in install.sh variables.sh dkms_common.postinst; do
+    [[ -f "$EXTRACTED/$file" ]] || fail "Missing installer payload file: $file"
 done
 
-# Disable the Debian 12+ block in postinst that strips AUTOINSTALL="yes" from dkms.conf
-# (ABB #11026 — without AUTOINSTALL, DKMS refuses to build the module automatically)
-info "  Patching postinst: disabling Debian 12+ DKMS autoinstall removal..."
-sed -i "s|sed -i '/AUTOINSTALL=\"yes\"/d' /usr/src/|# sed -i '/AUTOINSTALL=\"yes\"/d' /usr/src/|" \
-    "$SNAP_WORK/repack/DEBIAN/postinst"
+shopt -s nullglob
+AGENT_DEBS=("$EXTRACTED"/Synology\ Active\ Backup\ for\ Business\ Agent-*.deb)
+SNAP_DEBS=("$EXTRACTED"/synosnap-*.deb)
+[[ ${#AGENT_DEBS[@]} == 1 && ${#SNAP_DEBS[@]} == 1 ]] ||
+    fail "Expected exactly one agent DEB and one synosnap DEB"
+ORIG_AGENT_DEB="${AGENT_DEBS[0]}"
+ORIG_SYNOSNAP_DEB="${SNAP_DEBS[0]}"
+[[ "$(dpkg-deb -f "$ORIG_AGENT_DEB" Package)" == "$AGENT_PACKAGE_NAME" &&
+   "$(dpkg-deb -f "$ORIG_AGENT_DEB" Version)" == "$SOURCE_AGENT_VERSION" &&
+   "$(dpkg-deb -f "$ORIG_AGENT_DEB" Architecture)" == amd64 ]] ||
+    fail "Expected the official amd64 agent package $SOURCE_AGENT_VERSION"
+[[ "$(dpkg-deb -f "$ORIG_SYNOSNAP_DEB" Package)" == "$DATTOBD_PACKAGE_NAME" &&
+   "$(dpkg-deb -f "$ORIG_SYNOSNAP_DEB" Version)" == "$SOURCE_SYNOSNAP_VERSION" &&
+   "$(dpkg-deb -f "$ORIG_SYNOSNAP_DEB" Architecture)" == amd64 ]] ||
+    fail "Expected the official amd64 synosnap package $SOURCE_SYNOSNAP_VERSION"
 
-# Build the patched synosnap DEB
-PATCHED_SYNOSNAP_DEB="$WORKDIR/synosnap-${SYNOSNAP_VERSION}.deb"
-dpkg-deb --root-owner-group -b "$SNAP_WORK/repack" "$PATCHED_SYNOSNAP_DEB"
-ok "Built patched synosnap DEB"
+# Update package checksums and installed size after every content modification.
+refresh_metadata() {
+    local root="$1" size
+    (
+        cd "$root"
+        find . -path './DEBIAN' -prune -o -type f -printf '%P\0' |
+            sort -z | xargs -0 -r md5sum > DEBIAN/md5sums
+    )
+    size="$(du -sk --exclude=DEBIAN "$root" | awk '{print $1}')"
+    sed -i "s/^Installed-Size: .*/Installed-Size: $size/" "$root/DEBIAN/control"
+    chmod 0755 "$root/DEBIAN"
+    chmod 0644 "$root/DEBIAN/control" "$root/DEBIAN/md5sums"
+}
 
-# --- Step 3: Repackage agent DEB with updated version ---
-info "Repacking agent DEB with version ${AGENT_VERSION}..."
+info "Repacking synosnap $SYNOSNAP_VERSION"
+SNAP_ROOT="$WORKDIR/synosnap"
+dpkg-deb -R "$ORIG_SYNOSNAP_DEB" "$SNAP_ROOT"
+SNAP_SRC="$SNAP_ROOT/usr/src/synosnap-$SYNOSNAP_VERSION"
+mv "$SNAP_ROOT/usr/src/synosnap-$SOURCE_SYNOSNAP_VERSION" "$SNAP_SRC"
+sed -i "s/^Version: .*/Version: $SYNOSNAP_VERSION/" "$SNAP_ROOT/DEBIAN/control"
 
-AGENT_WORK="$WORKDIR/agent_repack"
-mkdir -p "$AGENT_WORK"
+# Overlay the entire maintained patch tree, including dkms.conf and its hooks.
+# Source files use fixed modes because DrvFS checkouts can report every file as
+# executable. Existing vendor files outside this patch set remain untouched.
+while IFS= read -r -d '' file; do
+    relative="${file#"$PATCHES_DIR/synosnap/"}"
+    mkdir -p "$(dirname "$SNAP_SRC/$relative")"
+    sed 's/\r$//' "$file" > "$SNAP_SRC/$relative"
+    chmod 0644 "$SNAP_SRC/$relative"
+done < <(find "$PATCHES_DIR/synosnap" -type f -print0)
+chmod 0755 "$SNAP_SRC/genconfig.sh" "$SNAP_SRC/dkms_pre_install"
+grep -qx "PACKAGE_VERSION=\"$SYNOSNAP_VERSION\"" "$SNAP_SRC/dkms.conf" ||
+    fail "dkms.conf PACKAGE_VERSION disagrees with variables.sh"
 
-dpkg-deb -R "$ORIG_AGENT_DEB" "$AGENT_WORK/repack"
-chmod 0755 "$AGENT_WORK/repack/DEBIAN"
+# The vendor Debian 12+ workaround disables autoinstall. Preserve it so a future
+# kernel upgrade rebuilds the patched module automatically.
+sed -i \
+    -e "s|sed -i '/AUTOINSTALL=\"yes\"/d' /usr/src/|# Keep AUTOINSTALL for kernel upgrades: /usr/src/|" \
+    -e 's/Debian 12+ detected, disable DKMS autoinstall/Debian 12+ detected, retain DKMS autoinstall/' \
+    "$SNAP_ROOT/DEBIAN/postinst"
+refresh_metadata "$SNAP_ROOT"
+PATCHED_SYNOSNAP_DEB="$WORKDIR/$DATTOBD_PACKAGE"
+dpkg-deb --root-owner-group -b "$SNAP_ROOT" "$PATCHED_SYNOSNAP_DEB"
 
-# Update version in control file
-sed -i "s/^Version: .*/Version: ${AGENT_VERSION}/" "$AGENT_WORK/repack/DEBIAN/control"
+info "Repacking agent $FULL_AGENT_VERSION"
+AGENT_ROOT="$WORKDIR/agent"
+dpkg-deb -R "$ORIG_AGENT_DEB" "$AGENT_ROOT"
+sed -i "s/^Version: .*/Version: $FULL_AGENT_VERSION/" "$AGENT_ROOT/DEBIAN/control"
+DRIVER_INFO="$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/data/DRIVER_INFO"
+[[ -f "$DRIVER_INFO" ]] || fail "Agent DRIVER_INFO is missing"
+SYNOSNAP_VERSION="$SYNOSNAP_VERSION" AGENT_BUILD_TAG="$AGENT_BUILD_TAG" \
+    perl -0777 -pi -e '
+        s/("version"\s*:\s*")[^"]+(")/$1$ENV{SYNOSNAP_VERSION}-$ENV{AGENT_BUILD_TAG}$2/
+            or die "DRIVER_INFO version not found\n";
+    ' "$DRIVER_INFO"
 
-# Update DRIVER_INFO version tag
-DRIVER_INFO="$AGENT_WORK/repack/opt/Synology/ActiveBackupforBusiness/data/DRIVER_INFO"
-if [ -f "$DRIVER_INFO" ]; then
-    sed -i "s/\"version\": \"${SYNOSNAP_VERSION}\"/\"version\": \"${SYNOSNAP_VERSION}-${AGENT_BUILD_TAG}\"/" "$DRIVER_INFO"
-fi
-
-# Binary-patch build number in abb-cli and service-ctrl (5053 → 5054)
-# The binaries store the build number as a null-terminated 4-byte string "5053\0".
-# We replace it with "5054" (same length) so `abb-cli -v` shows 3.2.0-5054.
-info "  Patching build number in binaries (5053 → 5055)..."
-for bin in \
-    "$AGENT_WORK/repack/bin/abb-cli" \
-    "$AGENT_WORK/repack/opt/Synology/ActiveBackupforBusiness/bin/service-ctrl" \
-    "$AGENT_WORK/repack/opt/Synology/ActiveBackupforBusiness/bin/synology-backupd"; do
-    if [ -f "$bin" ]; then
-        perl -pi -e 's/build\x005053\x00/build\x005055\x00/g' "$bin"
-        ok "  Patched $(basename "$bin")"
-    fi
+# Update only the vendor's existing fixed-length build string; a different
+# layout should fail the build rather than silently produce inconsistent assets.
+for binary in \
+    "$AGENT_ROOT/bin/abb-cli" \
+    "$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/bin/service-ctrl" \
+    "$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/bin/synology-backupd"; do
+    [[ -f "$binary" ]] || fail "Missing agent binary: $binary"
+    AGENT_BUILD_TAG="$AGENT_BUILD_TAG" perl -0777 -pi -e '
+        s/build\x005053\x00/"build\0".$ENV{AGENT_BUILD_TAG}."\0"/ge
+            or die "Original build tag not found in $ARGV\n";
+    ' "$binary"
 done
+refresh_metadata "$AGENT_ROOT"
+PATCHED_AGENT_DEB="$WORKDIR/$AGENT_PACKAGE"
+dpkg-deb --root-owner-group -b "$AGENT_ROOT" "$PATCHED_AGENT_DEB"
 
-# Build the patched agent DEB
-PATCHED_AGENT_DEB="$WORKDIR/Synology Active Backup for Business Agent-${AGENT_VERSION}.deb"
-dpkg-deb --root-owner-group -b "$AGENT_WORK/repack" "$PATCHED_AGENT_DEB"
-ok "Built patched agent DEB (version ${AGENT_VERSION})"
-
-# --- Step 4: Build the install.run self-extracting archive ---
-info "Building install.run..."
-
+info "Building install.run"
 PAYLOAD_DIR="$WORKDIR/payload"
 mkdir -p "$PAYLOAD_DIR"
+for file in install.sh dkms_common.postinst; do
+    sed 's/\r$//' "$EXTRACTED/$file" > "$PAYLOAD_DIR/$file"
+    chmod 0755 "$PAYLOAD_DIR/$file"
+done
+sed 's/\r$//' "$PATCHES_DIR/variables.sh" > "$PAYLOAD_DIR/variables.sh"
+cp "$PATCHED_SYNOSNAP_DEB" "$PATCHED_AGENT_DEB" "$PAYLOAD_DIR/"
+chmod 0644 "$PAYLOAD_DIR/variables.sh" "$PAYLOAD_DIR/"*.deb
+PAYLOAD_TAR="$WORKDIR/payload.tar.gz"
+tar -C "$PAYLOAD_DIR" --owner=0 --group=0 --numeric-owner -czf "$PAYLOAD_TAR" .
+PAYLOAD_SHA256="$(sha256sum "$PAYLOAD_TAR" | awk '{print $1}')"
 
-# Copy installer scripts from original
-cp "$EXTRACTED/install.sh" "$PAYLOAD_DIR/"
-cp "$EXTRACTED/dkms_common.postinst" "$PAYLOAD_DIR/"
-
-# Copy patched variables.sh (strip CRLF in case of Windows checkout)
-sed 's/\r//' "$PATCHES_DIR/variables.sh" > "$PAYLOAD_DIR/variables.sh"
-
-# Copy patched DEBs (with the names the installer expects from variables.sh)
-cp "$PATCHED_SYNOSNAP_DEB" "$PAYLOAD_DIR/synosnap-${SYNOSNAP_VERSION}.deb"
-cp "$PATCHED_AGENT_DEB" "$PAYLOAD_DIR/Synology Active Backup for Business Agent-${AGENT_VERSION}.deb"
-
-OUTPUT_FILE="$OUTPUT_DIR/install.run"
-
-# Try makeself first, fall back to manual tar+shell approach
-if command -v makeself &>/dev/null; then
-    info "Using makeself..."
-    makeself --gzip "$PAYLOAD_DIR" "$OUTPUT_FILE" \
-        "Synology Active Backup for Business Agent ${AGENT_VERSION}" \
-        ./install.sh
-else
-    info "makeself not found, building archive manually..."
-    PAYLOAD_TAR="$WORKDIR/payload.tar.gz"
-    (cd "$PAYLOAD_DIR" && tar czf "$PAYLOAD_TAR" .)
-
-    cat > "$OUTPUT_FILE" << 'HEADER'
+# One archive format on every build host; inspection never executes install.sh.
+OUTPUT_FILE="$WORKDIR/install.run"
+cat > "$OUTPUT_FILE" <<'HEADER'
 #!/bin/bash
-# Synology Active Backup for Business Agent - Patched installer
-# Kernel 6.15-7.0 support (5055 build)
-echo "Synology Active Backup for Business Agent"
-echo "Extracting..."
-
-TMPDIR=$(mktemp -d)
-ARCHIVE=$(awk '/^__ARCHIVE_BELOW__/ {print NR + 1; exit 0; }' "$0")
-
-tail -n+${ARCHIVE} "$0" | tar xzf - -C "$TMPDIR"
-if [ $? -ne 0 ]; then
-    echo "Error extracting archive"
-    exit 1
+# Community-patched Synology Active Backup for Business Agent installer.
+set -euo pipefail
+PAYLOAD_SHA256='@PAYLOAD_SHA256@'
+VERSION='@VERSION@'
+usage() {
+    printf '%s\n' \
+        "Synology Active Backup for Business Agent $VERSION" \
+        "Usage: sudo bash install.run [installer arguments]" \
+        "       bash install.run --check" \
+        "       bash install.run --noexec --target DIRECTORY" \
+        "       bash install.run --extract DIRECTORY"
+}
+fail() { printf 'Error: %s\n' "$*" >&2; exit 1; }
+MODE=install
+TARGET=''
+case "${1:-}" in
+    --help|-h) usage; exit 0 ;;
+    --check) [[ $# == 1 ]] || fail "--check takes no arguments"; MODE=check ;;
+    --extract)
+        [[ $# == 2 && -n "$2" ]] || fail "--extract requires a directory"
+        MODE=extract; TARGET="$2" ;;
+    --noexec)
+        [[ $# == 3 && "$2" == --target && -n "$3" ]] ||
+            fail "Use --noexec --target DIRECTORY"
+        MODE=extract; TARGET="$3" ;;
+esac
+for tool in sha256sum tail awk tar mktemp; do
+    command -v "$tool" >/dev/null || fail "Required command not found: $tool"
+done
+ARCHIVE="$(awk '/^__ARCHIVE_BELOW__$/ {print NR + 1; exit}' "$0")"
+[[ "$ARCHIVE" =~ ^[0-9]+$ ]] || fail "Archive marker is missing"
+ACTUAL_SHA256="$(tail -n +"$ARCHIVE" "$0" | sha256sum | awk '{print $1}')"
+[[ "$ACTUAL_SHA256" == "$PAYLOAD_SHA256" ]] || fail "Payload SHA-256 mismatch"
+if [[ "$MODE" == check ]]; then
+    printf 'Payload SHA-256 verified.\n'
+    exit 0
 fi
-
-echo "Running installer..."
-cd "$TMPDIR"
+if [[ "$MODE" == extract ]]; then
+    if [[ -e "$TARGET" ]]; then
+        [[ -d "$TARGET" && -z "$(ls -A "$TARGET")" ]] ||
+            fail "Extraction target must be an empty directory"
+    else
+        mkdir -p -- "$TARGET"
+    fi
+    tail -n +"$ARCHIVE" "$0" | tar xzf - -C "$TARGET"
+    printf 'Extracted to %s\n' "$TARGET"
+    exit 0
+fi
+[[ "$EUID" == 0 ]] || fail "Run installation as root: sudo bash install.run"
+WORKDIR="$(mktemp -d "${TMPDIR:-/tmp}/abb-install.XXXXXX")"
+trap 'rm -rf -- "$WORKDIR"' EXIT
+tail -n +"$ARCHIVE" "$0" | tar xzf - -C "$WORKDIR"
+cd "$WORKDIR"
 bash ./install.sh "$@"
-RET=$?
-cd /
-rm -rf "$TMPDIR"
-exit $RET
-
+exit $?
 __ARCHIVE_BELOW__
 HEADER
+sed -i -e "s/@PAYLOAD_SHA256@/$PAYLOAD_SHA256/" \
+    -e "s/@VERSION@/$FULL_AGENT_VERSION/" "$OUTPUT_FILE"
+cat "$PAYLOAD_TAR" >> "$OUTPUT_FILE"
+chmod 0755 "$OUTPUT_FILE"
+bash "$OUTPUT_FILE" --check
 
-    cat "$PAYLOAD_TAR" >> "$OUTPUT_FILE"
-    chmod +x "$OUTPUT_FILE"
-fi
-
-ok "Created: $OUTPUT_FILE"
-ls -lh "$OUTPUT_FILE"
-
-echo ""
-info "Done! Deploy with:  sudo bash install.run"
+cp "$OUTPUT_FILE" "$PATCHED_SYNOSNAP_DEB" "$PATCHED_AGENT_DEB" "$OUTPUT_DIR/"
+(
+    cd "$OUTPUT_DIR"
+    sha256sum install.run "$DATTOBD_PACKAGE" "$AGENT_PACKAGE" > SHA256SUMS
+)
+info "Created install.run, both DEBs and SHA256SUMS in $OUTPUT_DIR"
+info "Verify with: sha256sum -c SHA256SUMS"
+info "Install with: sudo bash install.run"
