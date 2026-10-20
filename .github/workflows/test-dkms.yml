@@ -28,9 +28,9 @@ jobs:
         env:
           INSTALLER_URL: ${{ secrets.SYNOLOGY_INSTALLER_URL }}
         run: |
-          INSTALLER_URL="${INSTALLER_URL:-https://global.synologydownload.com/download/Utility/ActiveBackupBusinessAgent/3.2.0-5053/Linux/x86_64/Synology%20Active%20Backup%20for%20Business%20Agent-3.2.0-5053-x64-deb.zip}"
+          INSTALLER_URL="${INSTALLER_URL:-https://global.synologydownload.com/download/Utility/ActiveBackupBusinessAgent/3.2.1-5059/Linux/x86_64/Synology%20Active%20Backup%20for%20Business%20Agent-3.2.1-5059-x64-deb.zip}"
           curl --fail --location --retry 3 "$INSTALLER_URL" -o synology.zip
-          echo 'b6625ae7b8a5bfdcb03647f8335b7de70d6bb51d11da2c27ea3fec036a68a22f  synology.zip' | sha256sum --check
+          echo 'fced96c8540b2ba3a637e07e3c9bec5913681f0ebe76b785f6c855f97598d816  synology.zip' | sha256sum --check
           unzip -q synology.zip -d synology_pkg
           mapfile -d '' RUNS < <(find synology_pkg -maxdepth 3 -name '*.run' -print0)
           if [ "${#RUNS[@]}" -ne 1 ]; then
@@ -44,6 +44,26 @@ jobs:
           bash build-tools/build.sh "$SYNOLOGY_INPUT"
           bash verify_build.sh install.run
           sha256sum --check SHA256SUMS
+
+      - name: Reject an old agent release with current version metadata
+        run: |
+          FIXTURE_DIR=$(mktemp -d)
+          trap 'rm -rf -- "$FIXTURE_DIR"' EXIT
+          curl --fail --location --retry 3 \
+            'https://global.synologydownload.com/download/Utility/ActiveBackupBusinessAgent/3.2.0-5053/Linux/x86_64/Synology%20Active%20Backup%20for%20Business%20Agent-3.2.0-5053-x64-deb.zip' \
+            -o "$FIXTURE_DIR/synology.zip"
+          (cd "$FIXTURE_DIR" && echo 'b6625ae7b8a5bfdcb03647f8335b7de70d6bb51d11da2c27ea3fec036a68a22f  synology.zip' | sha256sum --check)
+          unzip -q "$FIXTURE_DIR/synology.zip" -d "$FIXTURE_DIR/original"
+          mapfile -d '' RUNS < <(find "$FIXTURE_DIR/original" -maxdepth 3 -name '*.run' -print0)
+          test "${#RUNS[@]}" -eq 1
+          # Read the Makeself archive boundary without executing the installer.
+          SKIP_LINES=$(sed -n 's/^skip="\([0-9][0-9]*\)"$/\1/p' "${RUNS[0]}" | head -n 1)
+          [[ "$SKIP_LINES" =~ ^[0-9]+$ ]]
+          mkdir "$FIXTURE_DIR/payload"
+          tail -n +"$((10#$SKIP_LINES + 1))" "${RUNS[0]}" |
+            tar xzf - -C "$FIXTURE_DIR/payload"
+          bash tests/agent-version.sh install.run \
+            "$FIXTURE_DIR/payload/Synology Active Backup for Business Agent-3.2.0-5053.deb"
 
       - name: Read patched module package metadata
         id: meta
