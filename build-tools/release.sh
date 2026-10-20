@@ -91,24 +91,41 @@ api_get() {
     sed '1,/^\r\{0,1\}$/d' "$WORK/response"
 }
 BASE="repos/$GITHUB_REPOSITORY"
-# The /releases/tags endpoint omits drafts whose tags do not exist yet.
-# Authenticated release listings include drafts for collaborators with push access.
+# Drafts with an uncreated tag can expose a synthetic tag or "untagged-*" URL.
+# GitHub CLI resolves their pending tag through GraphQL, then reads REST by ID.
 find_release() {
-    local page=1 releases count matches
-    : > "$WORK/release-matches"
-    while :; do
-        releases=$(api_get "$BASE/releases?per_page=100&page=$page") || return $?
-        count=$(jq -er 'if type == "array" then length else error("expected release list") end' <<< "$releases") ||
-            fail "Invalid GitHub release listing"
-        jq -c --arg tag "$TAG" '.[] | select(.tag_name == $tag)' <<< "$releases" >> "$WORK/release-matches" ||
-            fail "Invalid GitHub release listing"
-        [[ "$count" == 100 ]] || break
-        ((page+=1))
-    done
-    matches=$(jq -s 'length' "$WORK/release-matches") || fail "Invalid GitHub release matches"
-    [[ "$matches" != 0 ]] || return 44
-    [[ "$matches" == 1 ]] || fail "Multiple releases exist for $TAG"
-    cat "$WORK/release-matches"
+    local response id release draft
+    # GraphQL variables must reach gh literally; they are not shell variables.
+    # shellcheck disable=SC2016
+    response=$(gh api graphql \
+        -f query='query($owner: String!, $name: String!, $tag: String!) {
+            repository(owner: $owner, name: $name) {
+                release(tagName: $tag) { databaseId isDraft }
+            }
+        }' \
+        -f owner="${GITHUB_REPOSITORY%/*}" -f name="${GITHUB_REPOSITORY#*/}" -f tag="$TAG") ||
+        fail "GitHub GraphQL release lookup failed"
+    jq -e '((.errors // []) | length) == 0 and
+        (.data.repository | type == "object" and has("release"))' <<< "$response" >/dev/null ||
+        fail "Invalid GitHub GraphQL release response"
+    [[ "$(jq -r '.data.repository.release == null' <<< "$response")" != true ]] || return 44
+    id=$(jq -er '.data.repository.release.databaseId | numbers' <<< "$response") ||
+        fail "Invalid GitHub release ID"
+    [[ "$id" =~ ^[0-9]+$ ]] || fail "Invalid GitHub release ID"
+    draft=$(jq -r '.data.repository.release.isDraft' <<< "$response")
+    [[ "$draft" == true || "$draft" == false ]] || fail "Invalid GitHub draft state"
+    release=$(api_get "$BASE/releases/$id") || fail "Could not read resolved GitHub release $id"
+    [[ "$(jq -r '.id' <<< "$release")" == "$id" &&
+        "$(jq -r '.draft' <<< "$release")" == "$draft" ]] ||
+        fail "Release identity changed during lookup"
+    if [[ "$draft" == false ]]; then
+        [[ "$(jq -r '.tag_name' <<< "$release")" == "$TAG" ]] ||
+            fail "Published release has an unexpected tag"
+    fi
+    # This local field records the pending tag confirmed by GraphQL; retain the
+    # raw REST tag_name for the separate check after publication.
+    jq --arg tag "$TAG" '. + {verified_tag_name: $tag}' <<< "$release" ||
+        fail "Invalid GitHub release metadata"
 }
 check_tag() {
     local object type sha depth=0 result=0
@@ -158,15 +175,15 @@ EOF
     gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft \
         --target "$GITHUB_SHA" --title "$VERSION — Ubuntu 26.04 / Linux 7.0" \
         --notes-file "$WORK/notes.md"
-    RELEASE=$(find_release)
+    RELEASE=$(find_release) || fail "Created draft could not be resolved by its pending tag"
 elif [[ "$result" != 0 ]]; then
     exit "$result"
 fi
 [[ "$(jq -r '.draft' <<< "$RELEASE")" == true ]] ||
     fail "Release $TAG is already published; refusing to overwrite it"
 [[ "$(jq -r '.target_commitish' <<< "$RELEASE")" == "$GITHUB_SHA" ]] ||
-    fail "Existing draft does not target the exact tested commit"
-[[ "$(jq -r '.tag_name' <<< "$RELEASE")" == "$TAG" ]] ||
+    fail "Existing draft does not target the exact tested commit $GITHUB_SHA; review and retarget that draft before retrying"
+[[ "$(jq -r '.verified_tag_name' <<< "$RELEASE")" == "$TAG" ]] ||
     fail "Unexpected release tag"
 RELEASE_ID=$(jq -er '.id | numbers' <<< "$RELEASE")
 # A retry may replace our four files in a partial draft, but must not publish
@@ -177,10 +194,11 @@ done < <(jq -r '.assets[].name' <<< "$RELEASE")
 UPLOADS=()
 for name in "${ASSETS[@]}"; do UPLOADS+=("$STAGED/$name"); done
 gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${UPLOADS[@]}"
-RELEASE=$(api_get "$BASE/releases/$RELEASE_ID")
+RELEASE=$(find_release) || fail "Draft disappeared after upload"
 [[ "$(jq -r '.draft' <<< "$RELEASE")" == true &&
+    "$(jq -r '.id' <<< "$RELEASE")" == "$RELEASE_ID" &&
     "$(jq -r '.target_commitish' <<< "$RELEASE")" == "$GITHUB_SHA" &&
-    "$(jq -r '.tag_name' <<< "$RELEASE")" == "$TAG" ]] ||
+    "$(jq -r '.verified_tag_name' <<< "$RELEASE")" == "$TAG" ]] ||
     fail "Draft was changed during upload"
 [[ "$(jq '.assets | length' <<< "$RELEASE")" == 4 ]] ||
     fail "Expected four uploaded release assets"
@@ -204,7 +222,18 @@ for name in "${ASSETS[@]}"; do
     fi
 done
 check_tag
-gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
+# Re-resolve the pending tag immediately before publication, so a retagged or
+# replaced draft cannot be published after its assets have been checked.
+RELEASE=$(find_release) || fail "Draft disappeared before publication"
+[[ "$(jq -r '.draft' <<< "$RELEASE")" == true &&
+    "$(jq -r '.id' <<< "$RELEASE")" == "$RELEASE_ID" &&
+    "$(jq -r '.target_commitish' <<< "$RELEASE")" == "$GITHUB_SHA" ]] ||
+    fail "Draft was changed before publication"
+gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --tag "$TAG" \
+    --target "$GITHUB_SHA" --draft=false --latest
 RELEASE=$(api_get "$BASE/releases/$RELEASE_ID")
 [[ "$(jq -r '.draft' <<< "$RELEASE")" == false ]] || fail "Release is still a draft"
+[[ "$(jq -r '.tag_name' <<< "$RELEASE")" == "$TAG" ]] || fail "Published release has an unexpected tag"
+# Unlike a draft, a published release must have an actual matching Git ref.
+GITHUB_EVENT_NAME=push check_tag
 echo "Published https://github.com/$GITHUB_REPOSITORY/releases/tag/$TAG"

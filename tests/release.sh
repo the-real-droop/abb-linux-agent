@@ -52,14 +52,33 @@ def response(code, data):
     sys.exit(0 if code == 200 else 1)
 
 def release():
+    draft = not state.get("published", False) and case != "published"
     return {
         "id": 42,
-        "draft": not state.get("published", False) and case != "published",
+        "draft": draft,
         "target_commitish": "f" * 40 if case == "wrong-draft" else sha,
-        "tag_name": "v" + version,
+        # REST exposes a synthetic tag for pending drafts, even though GraphQL
+        # finds them by the intended version tag.
+        "tag_name": "untagged-fixture" if draft and case != "annotated" else "v" + version,
         "assets": state.get("assets", [{"name": "install.run"}] if case == "draft" else []),
     }
 
+if args[:2] == ["api", "graphql"]:
+    assert "tag=v" + version in args
+    if case == "graphql-error":
+        print(json.dumps({"data": {"repository": {"release": None}}, "errors": [{"message": "Forbidden"}]}))
+        sys.exit(0)
+    if case == "graphql-network":
+        sys.stderr.write("network unavailable\n")
+        sys.exit(1)
+    if case == "pending-tag-race" and state.get("assets"):
+        found = None
+    elif state.get("created") or case in ("draft", "wrong-draft", "published", "resolved-release-missing"):
+        found = {"databaseId": 42, "isDraft": release()["draft"]}
+    else:
+        found = None
+    print(json.dumps({"data": {"repository": {"release": found}}}))
+    sys.exit(0)
 if args[:2] == ["api", "--include"]:
     endpoint = args[2]
     if case == "api-403":
@@ -72,14 +91,14 @@ if args[:2] == ["api", "--include"]:
             response(200, {"object": {"type": "commit", "sha": "f" * 40}})
         if case == "annotated":
             response(200, {"object": {"type": "tag", "sha": "a" * 40}})
+        if state.get("published"):
+            response(200, {"object": {"type": "commit", "sha": sha}})
         response(404, {"message": "Not Found"})
     if "/git/tags/" in endpoint:
         response(200, {"object": {"type": "commit", "sha": sha}})
-    if "/releases?per_page=" in endpoint:
-        if not state.get("created") and case not in ("draft", "wrong-draft", "published"):
-            response(200, [])
-        response(200, [release()])
     if endpoint.endswith("/releases/42"):
+        if case == "resolved-release-missing":
+            response(404, {"message": "Not Found"})
         response(200, release())
     if "/releases/tags/" in endpoint:
         response(404, {"message": "Not Found"})
@@ -121,6 +140,8 @@ elif args[:2] == ["api", "-H"]:
     sys.stdout.buffer.write((root / asset["name"]).read_bytes())
 elif args[:2] == ["release", "edit"]:
     assert "--draft=false" in args and "--latest" in args
+    assert args[args.index("--tag") + 1] == "v" + version
+    assert args[args.index("--target") + 1] == sha
     assert len(state["assets"]) == 4
     state["published"] = True
     save()
@@ -160,6 +181,8 @@ elif mode == "publish":
     assert writes[-2:] == ["upload", "edit"], writes
     manifest = (root / "SHA256SUMS").read_text()
     import os
+    if os.environ["MOCK_CASE"] == "draft":
+        assert writes == ["upload", "edit"], "A pending draft must be reused, not recreated"
     assert f"synology-active-backup-business-agent-{os.environ['MOCK_VERSION']}-amd64.deb" in manifest
     assert "Synology Active" not in manifest
     import hashlib
@@ -201,9 +224,13 @@ run_case published "already published" none
 run_case wrong-draft "does not target the exact tested commit" none
 run_case api-403 "GitHub API request failed" none
 run_case api-network "GitHub API request failed" none
+run_case graphql-error "Invalid GitHub GraphQL release response" none
+run_case graphql-network "GitHub GraphQL release lookup failed" none
+run_case resolved-release-missing "Could not read resolved GitHub release" none
 run_case missing-asset "Expected four uploaded release assets" draft-only
 run_case bad-hash "Uploaded asset hash differs" draft-only
 run_case tag-race "does not point to the tested commit" draft-only
+run_case pending-tag-race "Draft disappeared after upload" draft-only
 # gh's upload failure itself must leave the release unpublished.
 run_case upload-failure "All agent binaries contain release" draft-only
 echo "PASS: release publication and failure-path regression tests."
