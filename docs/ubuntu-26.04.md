@@ -4,9 +4,15 @@ This build targets **Ubuntu 26.04, amd64 (x86-64), kernel
 `7.0.0-38-generic`**, from Ubuntu's `7.0.0-38.38` packages. The requested
 `7.0.0.38` is interpreted as that Ubuntu ABI release. Confirm with `uname -r`.
 
-The installer packages agent **3.2.0-5056** and DKMS module **0.12.13**.
-It retains the repository's official Synology **3.2.0-5053** binary base.
-It is a community patch, not an official Synology release.
+The installer reports agent **3.2.1-5060** and packages DKMS module **0.12.13**.
+It uses official Synology **3.2.1-5059** agent binaries, preserving their compiled
+`3.2.1` release and changing the embedded build number to `5060`. The installer,
+DEB metadata and DRIVER_INFO use the matching versions. This is a community
+build, not an official Synology release.
+
+The official `0.12.10` driver package is byte-for-byte equivalent after
+extraction between the `5053` and `5059` releases. The patched kernel source is
+unchanged from the tested `0.12.13` build.
 
 ## Installation
 
@@ -60,6 +66,9 @@ relying on it. No NAS credentials or server were available during this build.
   Ubuntu ABI identification uses `include/config/kernel.release`.
 - Versions, agent build strings, DRIVER_INFO and DEB checksums are consistent.
   The archive verifies its payload before extraction or installation.
+- The builder pins the official 3.2.1 binary hashes before patching. The
+  verifier restores only the build tag in temporary copies and checks those
+  hashes again, rejecting binaries from a different compiled release.
 - CI covers the exact Ubuntu package version and mainline 7.0 in addition to
   the existing kernel matrix.
 
@@ -90,6 +99,12 @@ The test found no kernel BUG, WARNING, Oops or panic. All snapshot info checks
 reported `error=0`. Package/source checks, payload checks and six negative
 configuration tests also passed.
 
+For the `3.2.1-5060` rebuild, an isolated Ubuntu 26.04 container with networking
+disabled confirmed the extracted daemon logs `service version: 3.2.1-5060`.
+No service was installed on the host. The version regression test also rejected
+an old `3.2.0` executable labeled with build `5060`, even with otherwise valid
+package metadata, file checksums and installer integrity.
+
 These tests cover module behavior, not a full Synology NAS backup/restore or a
 complete agent installation on a booted Ubuntu desktop/server. Other
 filesystems, storage configurations, Secure Boot and all older kernel matrix
@@ -99,11 +114,11 @@ validation described here.
 ## Reproduce
 
 Download the original x64 DEB ZIP from the
-[official Synology archive](https://archive.synology.com/download/Utility/ActiveBackupBusinessAgent/3.2.0-5053).
+[official Synology archive](https://archive.synology.com/download/Utility/ActiveBackupBusinessAgent/3.2.1-5059).
 The ZIP used here has SHA-256:
 
 ```text
-b6625ae7b8a5bfdcb03647f8335b7de70d6bb51d11da2c27ea3fec036a68a22f
+fced96c8540b2ba3a637e07e3c9bec5913681f0ebe76b785f6c855f97598d816
 ```
 
 ```bash

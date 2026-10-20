@@ -1,5 +1,5 @@
 #!/bin/bash
-# Repackage the official 3.2.0-5053 amd64 installer with the repository patches.
+# Repackage the official 3.2.1-5059 amd64 installer with the repository patches.
 # Usage: bash build-tools/build.sh <original-install.run | extracted-directory>
 # OUTPUT_DIR selects the directory for install.run, both DEBs and SHA256SUMS.
 # TEMP_DIR selects a Linux scratch directory; no installation is performed.
@@ -10,7 +10,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PATCHES_DIR="$SCRIPT_DIR/patches"
 OUTPUT_DIR="${OUTPUT_DIR:-$(pwd)}"
 TEMP_DIR="${TEMP_DIR:-/tmp}"
-SOURCE_AGENT_VERSION="3.2.0-5053"
+SOURCE_AGENT_VERSION="3.2.1-5059"
+SOURCE_AGENT_RELEASE="${SOURCE_AGENT_VERSION%-*}"
+SOURCE_AGENT_BUILD="${SOURCE_AGENT_VERSION##*-}"
 SOURCE_SYNOSNAP_VERSION="0.12.10"
 
 info() { printf '[INFO] %s\n' "$*"; }
@@ -28,8 +30,10 @@ AGENT_BUILD_TAG="$AGENT_VERSION"
 FULL_AGENT_VERSION="${AGENT_PACKAGE#Synology Active Backup for Business Agent-}"
 FULL_AGENT_VERSION="${FULL_AGENT_VERSION%.deb}"
 SYNOSNAP_VERSION="$DATTOBD_VERSION"
-[[ "$FULL_AGENT_VERSION" == "3.2.0-$AGENT_BUILD_TAG" ]] ||
-    fail "Agent package filename and build tag disagree in variables.sh"
+[[ "$AGENT_RELEASE" == "$SOURCE_AGENT_RELEASE" ]] ||
+    fail "Agent release must match the official binary base $SOURCE_AGENT_RELEASE"
+[[ "$FULL_AGENT_VERSION" == "$AGENT_RELEASE-$AGENT_BUILD_TAG" ]] ||
+    fail "Agent package filename, release and build tag disagree in variables.sh"
 [[ "$DATTOBD_PACKAGE" == "synosnap-$SYNOSNAP_VERSION.deb" ]] ||
     fail "synosnap package filename and version disagree in variables.sh"
 [[ "$AGENT_BUILD_TAG" =~ ^[0-9]{4}$ ]] ||
@@ -131,6 +135,9 @@ dpkg-deb --root-owner-group -b "$SNAP_ROOT" "$PATCHED_SYNOSNAP_DEB"
 info "Repacking agent $FULL_AGENT_VERSION"
 AGENT_ROOT="$WORKDIR/agent"
 dpkg-deb -R "$ORIG_AGENT_DEB" "$AGENT_ROOT"
+# Pin the compiled release too: DEB metadata alone cannot establish which
+# semantic version the embedded agent code will report.
+(cd "$AGENT_ROOT" && sha256sum --check "$SCRIPT_DIR/agent-binaries.sha256")
 sed -i "s/^Version: .*/Version: $FULL_AGENT_VERSION/" "$AGENT_ROOT/DEBIAN/control"
 DRIVER_INFO="$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/data/DRIVER_INFO"
 [[ -f "$DRIVER_INFO" ]] || fail "Agent DRIVER_INFO is missing"
@@ -140,16 +147,19 @@ SYNOSNAP_VERSION="$SYNOSNAP_VERSION" AGENT_BUILD_TAG="$AGENT_BUILD_TAG" \
             or die "DRIVER_INFO version not found\n";
     ' "$DRIVER_INFO"
 
-# Update only the vendor's existing fixed-length build string; a different
-# layout should fail the build rather than silently produce inconsistent assets.
+# The semantic release is compiled into the vendor binaries. Use a matching
+# official release and change only its existing fixed-length build string.
+# Fail on unexpected layouts rather than silently reporting mixed versions.
 for binary in \
     "$AGENT_ROOT/bin/abb-cli" \
     "$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/bin/service-ctrl" \
     "$AGENT_ROOT/opt/Synology/ActiveBackupforBusiness/bin/synology-backupd"; do
     [[ -f "$binary" ]] || fail "Missing agent binary: $binary"
-    AGENT_BUILD_TAG="$AGENT_BUILD_TAG" perl -0777 -pi -e '
-        s/build\x005053\x00/"build\0".$ENV{AGENT_BUILD_TAG}."\0"/ge
-            or die "Original build tag not found in $ARGV\n";
+    SOURCE_AGENT_BUILD="$SOURCE_AGENT_BUILD" AGENT_BUILD_TAG="$AGENT_BUILD_TAG" \
+        perl -0777 -pi -e '
+        my $old = "build\0".$ENV{SOURCE_AGENT_BUILD}."\0";
+        my $count = s/\Q$old\E/"build\0".$ENV{AGENT_BUILD_TAG}."\0"/ge;
+        $count == 1 or die "Expected one original build tag in $ARGV; found $count\n";
     ' "$binary"
 done
 refresh_metadata "$AGENT_ROOT"

@@ -12,9 +12,10 @@ further upstream kernel API changes — leaving users on the latest distribution
 (Ubuntu 25.04/25.10) unable to back up their machines. This project patches the
 module source and repackages the installer so it works again.
 
-The version is bumped only slightly (`3.2.0-5056` over the base official `3.2.0-5053`),
-so when Synology eventually releases an official update with proper kernel
-support, ABB will automatically install their version over this one.
+The community build reports **`3.2.1-5060`**, including the installer, DEB
+metadata and embedded agent version. It uses the official **`3.2.1-5059`**
+agent binaries with their build number updated to `5060` and the kernel patches
+described below. Their compiled semantic version is already `3.2.1`.
 
 ## Download
 
@@ -105,7 +106,7 @@ sudo apt install dpkg tar gzip perl
 
 ### Obtaining the original installer
 
-Download the official **Synology Active Backup for Business Agent 3.2.0-5053**
+Download the official **Synology Active Backup for Business Agent 3.2.1-5059**
 Linux installer (`.run` file) from the
 [Synology Download Center](https://www.synology.com/en-global/support/download).
 
@@ -134,7 +135,7 @@ Run `bash verify_build.sh install.run` to verify package metadata and sources.
 ## What is patched
 
 The `synosnap` kernel module source (`/usr/src/synosnap-0.12.13/`) is based on
-Synology's `0.12.10` (from `3.2.0-5053`) and patched to handle kernel API
+Synology's `0.12.10` (unchanged between `3.2.0-5053` and `3.2.1-5059`) and patched to handle kernel API
 changes from **6.15 through 7.0**:
 
 ### Ubuntu 26.04 / kernel 7.0.0-38
@@ -185,12 +186,12 @@ changes from **6.15 through 7.0**:
 build-tools/
   build.sh                       # Main build script
   patches/
-    variables.sh                 # Installer variable overrides (version 5056)
+    variables.sh                 # Installer version overrides (3.2.1-5060)
     synosnap/                    # Patched kernel module sources
       configure-tests/
         feature-tests/           # Kernel feature detection tests
 source/
-  install.run                    # Place official 3.2.0-5053 installer here (gitignored)
+  install.run                    # Place official 3.2.1-5059 installer here (gitignored)
 ```
 
 ## Disclaimer
